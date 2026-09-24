@@ -2,6 +2,7 @@ package formstream
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -22,7 +23,21 @@ var (
 )
 
 // Parse parses the multipart form from r.
-func (p *Parser) Parse(r io.Reader) (err error) {
+// It is equivalent to ParseContext with a background context.
+func (p *Parser) Parse(r io.Reader) error {
+	return p.ParseContext(context.Background(), r)
+}
+
+// ParseContext parses the multipart form from r, aborting when ctx is done.
+// It shares the whole parsing pipeline with Parse; the context is only
+// consulted while reading from r.
+//
+// When parsing aborts before the stream is fully consumed (corrupt input,
+// exhausted resource budget, hook failure, or context cancellation) and r
+// implements io.Closer, r is closed so that a blocked producer goroutine
+// writing to the stream is released. The close error never replaces the
+// first causal error; it is joined behind it.
+func (p *Parser) ParseContext(ctx context.Context, r io.Reader) (err error) {
 	hsc := newHookSatisfactionChecker(p.hookMap, &p.parserConfig)
 	defer func() {
 		deferErr := hsc.Close()
@@ -36,9 +51,35 @@ func (p *Parser) Parse(r io.Reader) (err error) {
 		}
 	}()
 
-	err = p.parse(r, hsc.IConditionJudger)
+	err = p.parse(ctxReader{ctx: ctx, r: r}, hsc.IConditionJudger)
+	if err != nil {
+		// The stream was not fully consumed. Release a potentially
+		// blocked producer on the other end of the stream.
+		if closer, ok := r.(io.Closer); ok {
+			if closeErr := closer.Close(); closeErr != nil {
+				err = errors.Join(err, closeErr)
+			}
+		}
+	}
 
 	return
+}
+
+// ctxReader aborts reads once ctx is done, reporting the context error as
+// the causal read error.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (cr ctxReader) Read(p []byte) (int, error) {
+	select {
+	case <-cr.ctx.Done():
+		return 0, cr.ctx.Err()
+	default:
+	}
+
+	return cr.r.Read(p)
 }
 
 func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, *normalParam, *abnormalParam]) error {
