@@ -41,13 +41,35 @@ func (p *Parser) Parse(r io.Reader) (err error) {
 	return
 }
 
-func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, *normalParam, *abnormalParam]) error {
+func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, *normalParam, *abnormalParam]) (err error) {
 	mr := multipart.NewReader(r, p.boundary)
+
+	// On an early exit (hook error, upstream read failure or cancellation),
+	// release any producer that may be blocked writing the current part.
+	// Draining is bounded by the part content: Part.Read reports EOF at the
+	// boundary. If the stream cannot reach the boundary (e.g. the upstream
+	// failed or was canceled), closing the source unblocks the producer,
+	// mirroring what net/http does when a handler returns with an unread body.
+	// Drain and close errors are intentionally discarded so the first causal
+	// error is preserved and successful parses keep returning nil.
+	var currentPart *multipart.Part
+	defer func() {
+		if currentPart != nil {
+			_, _ = io.Copy(io.Discard, currentPart)
+		}
+		if err != nil {
+			if closer, ok := r.(io.Closer); ok {
+				_ = closer.Close()
+			}
+		}
+	}()
+
 	for {
 		var part *multipart.Part
-		part, err := mr.NextPart()
+		part, err = mr.NextPart()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
+				err = nil
 				break
 			}
 			return fmt.Errorf("failed to read next part: %w", err)
@@ -64,6 +86,8 @@ func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, 
 			}
 			p.maxHeaders -= uint(len(header))
 		}
+
+		currentPart = part
 
 		header := newHeader(part.Header)
 		if hsc.IsHookExist(part.FormName()) {
@@ -102,6 +126,10 @@ func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, 
 		if err != nil {
 			return fmt.Errorf("failed to run satisfied hook: %w", err)
 		}
+
+		// The part was fully handled. Reaching the next NextPart (or EOF)
+		// lets mime/multipart consume the trailing boundary itself.
+		currentPart = nil
 	}
 
 	return nil
@@ -147,6 +175,7 @@ type preProcessor struct {
 	config *parserConfig
 	offset int64
 	file   *os.File
+	live   map[*bytes.Buffer]int
 }
 
 var bufPool = sync.Pool{
@@ -165,6 +194,7 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 	memLimit := min(pp.config.maxMemFileSize, pp.config.maxMemSize)
 	n, err := io.CopyN(buf, normalParam.r, int64(memLimit)+1)
 	if err != nil && !errors.Is(err, io.EOF) {
+		bufPool.Put(buf)
 		return nil, fmt.Errorf("failed to copy: %w", err)
 	}
 
@@ -173,6 +203,7 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 		if pp.file == nil {
 			f, err := os.CreateTemp("", "formstream-")
 			if err != nil {
+				bufPool.Put(buf)
 				return nil, fmt.Errorf("failed to create temp file: %w", err)
 			}
 			pp.file = f
@@ -180,11 +211,13 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 
 		bufSize, err := io.Copy(pp.file, buf)
 		if err != nil {
+			bufPool.Put(buf)
 			return nil, fmt.Errorf("failed to write: %w", err)
 		}
 
 		remainSize, err := io.Copy(pp.file, normalParam.r)
 		if err != nil {
+			bufPool.Put(buf)
 			return nil, fmt.Errorf("failed to copy: %w", err)
 		}
 
@@ -194,15 +227,24 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 
 		bufPool.Put(buf)
 	} else {
+		bufSize := buf.Len()
+		if pp.live == nil {
+			pp.live = make(map[*bytes.Buffer]int)
+		}
+		pp.live[buf] = bufSize
 		pp.config.maxMemSize -= DataSize(buf.Len())
 		pp.config.maxMemFileSize -= DataSize(buf.Len())
-		bufSize := buf.Len()
 		content = customReadCloser{
 			Reader: buf,
 			closeFunc: func() error {
+				size, ok := pp.live[buf]
+				if !ok {
+					return nil
+				}
+				delete(pp.live, buf)
 				bufPool.Put(buf)
-				pp.config.maxMemSize += DataSize(bufSize)
-				pp.config.maxMemFileSize += DataSize(bufSize)
+				pp.config.maxMemSize += DataSize(size)
+				pp.config.maxMemFileSize += DataSize(size)
 				return nil
 			},
 		}
@@ -215,6 +257,15 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 }
 
 func (pp *preProcessor) Close() error {
+	// Release contents pre-processed for hooks whose required parts never
+	// arrived (or whose abnormal path never ran).
+	for buf, size := range pp.live {
+		bufPool.Put(buf)
+		pp.config.maxMemSize += DataSize(size)
+		pp.config.maxMemFileSize += DataSize(size)
+	}
+	pp.live = nil
+
 	if pp.file == nil {
 		return nil
 	}
