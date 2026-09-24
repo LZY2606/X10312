@@ -3,10 +3,14 @@ package conditionjudge
 import (
 	"errors"
 	"fmt"
+	"sync"
 )
 
 type IConditionJudger[K comparable, S any, T any] interface {
 	IsHookExist(key K) bool
+	// IsSatisfied reports whether the hook for key is currently on the normal
+	// (fast) path. It returns false for hooks whose requirements are unmet.
+	IsSatisfied(key K) bool
 	HookEvent(key K, value S) (bool, error)
 	KeyEvent(key K) error
 }
@@ -18,6 +22,7 @@ type ConditionJudger[K comparable, S any, T any] struct {
 	satisfiedHookMap   map[K]func(S) error
 	unsatisfiedHookMap map[K]*waitHook[K, S, T]
 	requirementHookMap map[K][]*waitHook[K, S, T]
+	mu                 sync.RWMutex
 }
 
 type PreProcessFunc[S any, T any] func(S) (T, error)
@@ -69,6 +74,9 @@ func NewConditionJudger[K comparable, S any, T any](hookMap map[K]Hook[K, S, T],
 }
 
 func (w *ConditionJudger[K, S, T]) IsHookExist(key K) bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
 	if _, ok := w.satisfiedHookMap[key]; ok {
 		return true
 	}
@@ -77,10 +85,20 @@ func (w *ConditionJudger[K, S, T]) IsHookExist(key K) bool {
 	return ok
 }
 
+func (w *ConditionJudger[K, S, T]) IsSatisfied(key K) bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	_, ok := w.satisfiedHookMap[key]
+	return ok
+}
+
 var ErrNoHooks = errors.New("no hooks")
 
 func (w *ConditionJudger[K, S, T]) HookEvent(key K, value S) (bool, error) {
+	w.mu.RLock()
 	if fn := w.satisfiedHookMap[key]; fn != nil {
+		w.mu.RUnlock()
 		err := fn(value)
 		if err != nil {
 			return false, fmt.Errorf("failed to execute hook: %w", err)
@@ -88,11 +106,15 @@ func (w *ConditionJudger[K, S, T]) HookEvent(key K, value S) (bool, error) {
 
 		return true, nil
 	}
+	w.mu.RUnlock()
 
 	callParam, err := w.preProcessFunc(value)
 	if err != nil {
 		return false, fmt.Errorf("failed to pre-process: %w", err)
 	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
 
 	hookValue, ok := w.unsatisfiedHookMap[key]
 	if !ok {
@@ -104,6 +126,9 @@ func (w *ConditionJudger[K, S, T]) HookEvent(key K, value S) (bool, error) {
 }
 
 func (w *ConditionJudger[K, S, T]) KeyEvent(key K) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
 	hooks := w.requirementHookMap[key]
 
 	var errs []error

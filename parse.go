@@ -2,6 +2,7 @@ package formstream
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -21,8 +22,20 @@ var (
 	ErrTooLargeForm = errors.New("too large form")
 )
 
-// Parse parses the multipart form from r.
-func (p *Parser) Parse(r io.Reader) (err error) {
+// Parse parses the multipart form from r without a cancellation context.
+// Prefer [Parser.ParseContext] when the caller already has a context.
+func (p *Parser) Parse(r io.Reader) error {
+	return p.ParseContext(context.Background(), r)
+}
+
+// ParseContext parses the multipart form from r.
+//
+// Part bodies of fast-path hooks are streamed through a bounded buffer from a
+// producer goroutine: a slow consumer back-pressures the source reader instead
+// of buffering the whole file, and a consumer that reads only a prefix never
+// blocks the producer. Cancelling ctx, a failing source reader or a failing hook
+// all terminate the producer; the first causal error is preserved.
+func (p *Parser) ParseContext(ctx context.Context, r io.Reader) (err error) {
 	hsc := newHookSatisfactionChecker(p.hookMap, &p.parserConfig)
 	defer func() {
 		deferErr := hsc.Close()
@@ -36,229 +49,147 @@ func (p *Parser) Parse(r io.Reader) (err error) {
 		}
 	}()
 
-	err = p.parse(r, hsc.IConditionJudger)
-
-	return
+	return p.parse(ctx, r, hsc)
 }
 
-func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, *normalParam, *abnormalParam]) error {
+type partEventKind int
+
+const (
+	eventField partEventKind = iota
+	eventSpooled
+	eventLive
+)
+
+// partEvent is a hand-off from the producer goroutine to the driver. Every
+// event carries an ack channel the driver closes after the event (hook and/or
+// KeyEvent) is handled, preserving the original sequential ordering.
+type partEvent struct {
+	kind   partEventKind
+	name   string
+	header Header
+
+	// field
+	content []byte
+
+	// spooled (abnormal path)
+	abnormal *abnormalParam
+
+	// live (fast path)
+	stream *partStream
+
+	ack chan struct{}
+}
+
+// parse drives one producer goroutine (all multipart.Reader I/O, spooling and
+// budget accounting) and runs every hook on the caller goroutine. This is the
+// single execution path shared by the public adapters.
+func (p *Parser) parse(ctx context.Context, r io.Reader, hsc *hookSatisfactionChecker) error {
 	mr := multipart.NewReader(r, p.boundary)
+
+	events := make(chan *partEvent, 2)
+	terminal := make(chan error, 1)
+	cancel := make(chan struct{})
+	var cancelOnce sync.Once
+	abort := func() { cancelOnce.Do(func() { close(cancel) }) }
+
+	producer := &partProducer{
+		parser:   p,
+		hsc:      hsc,
+		mr:       mr,
+		ctx:      ctx,
+		events:   events,
+		terminal: terminal,
+		cancel:   cancel,
+	}
+	go producer.run()
+
+	var firstErr error
+	setErr := func(err error) {
+		if err != nil && firstErr == nil && !errors.Is(err, errStreamAborted) {
+			firstErr = err
+		}
+	}
+
+driverLoop:
 	for {
-		var part *multipart.Part
-		part, err := mr.NextPart()
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				break
+		select {
+		case <-ctx.Done():
+			setErr(ctx.Err())
+			abort()
+			break driverLoop
+		case ev := <-events:
+			if ev == nil {
+				break driverLoop
 			}
-			return fmt.Errorf("failed to read next part: %w", err)
+
+			handleErr := p.handleEvent(hsc.IConditionJudger, ev)
+			if handleErr != nil {
+				setErr(handleErr)
+				abort()
+			}
+			close(ev.ack)
+
+			if handleErr != nil {
+				break driverLoop
+			}
+		case err := <-terminal:
+			setErr(err)
+			break driverLoop
 		}
+	}
 
-		if p.maxParts == 0 {
-			return ErrTooManyParts
+	// Drain queued events until the producer has exited, so it can never block
+	// on a full channel and leak a goroutine.
+	eventsOpen := true
+	terminalOpen := true
+	for eventsOpen || terminalOpen {
+		select {
+		case ev := <-events:
+			if ev == nil {
+				eventsOpen = false
+			} else {
+				close(ev.ack)
+			}
+		case err := <-terminal:
+			setErr(err)
+			terminalOpen = false
 		}
-		p.maxParts--
+}
 
-		for _, header := range part.Header {
-			if p.maxHeaders < uint(len(header)) {
-				return ErrTooManyHeaders
-			}
-			p.maxHeaders -= uint(len(header))
+// handleEvent runs the exact public-facing side effect of a part on the
+// caller goroutine: storing a field, replaying a spooled hook, or executing a
+// fast-path hook followed by KeyEvent.
+func (p *Parser) handleEvent(hsc conditionjudge.IConditionJudger[string, *normalParam, *abnormalParam], ev *partEvent) error {
+	switch ev.kind {
+	case eventField:
+		p.valueMu.Lock()
+		p.valueMap[ev.name] = append(p.valueMap[ev.name], Value{
+			content: ev.content,
+			header:  ev.header,
+		})
+		p.valueMu.Unlock()
+
+		if err := hsc.KeyEvent(ev.name); err != nil {
+			return fmt.Errorf("failed to run satisfied hook: %w", err)
 		}
-
-		header := newHeader(part.Header)
-		if hsc.IsHookExist(part.FormName()) {
-			_, err := hsc.HookEvent(part.FormName(), &normalParam{
-				r: part,
-				h: header,
-			})
-			if err != nil {
-				return fmt.Errorf("failed to run or set hook: %w", err)
-			}
-		} else {
-			b := new(bytes.Buffer)
-
-			if DataSize(len(part.FormName())) > p.maxMemSize {
-				return ErrTooLargeForm
-			}
-			p.maxMemSize -= DataSize(len(part.FormName()))
-
-			n, err := io.Copy(b, part)
-			if err != nil {
-				return fmt.Errorf("failed to copy part: %w", err)
-			}
-
-			if uint64(n) > uint64(p.maxMemSize) {
-				return ErrTooLargeForm
-			}
-			p.maxMemSize -= DataSize(n)
-
-			p.valueMap[part.FormName()] = append(p.valueMap[part.FormName()], Value{
-				content: b.Bytes(),
-				header:  header,
-			})
+	case eventSpooled:
+		if _, err := hsc.HookEvent(ev.name, nil); err != nil {
+			return fmt.Errorf("failed to run or set hook: %w", err)
 		}
-
-		err = hsc.KeyEvent(part.FormName())
-		if err != nil {
+		if err := hsc.KeyEvent(ev.name); err != nil {
+			return fmt.Errorf("failed to run satisfied hook: %w", err)
+		}
+	case eventLive:
+		if _, err := hsc.HookEvent(ev.name, &normalParam{
+			r: ev.stream,
+			h: ev.header,
+		}); err != nil {
+			return fmt.Errorf("failed to run or set hook: %w", err)
+		}
+		if err := hsc.KeyEvent(ev.name); err != nil {
 			return fmt.Errorf("failed to run satisfied hook: %w", err)
 		}
 	}
 
 	return nil
-}
-
-type hookSatisfactionChecker struct {
-	conditionjudge.IConditionJudger[string, *normalParam, *abnormalParam]
-	preProcessor *preProcessor
-}
-
-func newHookSatisfactionChecker(streamHooks map[string]streamHook, config *parserConfig) *hookSatisfactionChecker {
-	judgeHooks := make(map[string]conditionjudge.Hook[string, *normalParam, *abnormalParam], len(streamHooks))
-	for name, hook := range streamHooks {
-		h := judgeHook(hook)
-		judgeHooks[name] = &h
-	}
-
-	preProcess := &preProcessor{
-		config: config,
-	}
-
-	return &hookSatisfactionChecker{
-		IConditionJudger: conditionjudge.NewConditionJudger(judgeHooks, preProcess.run),
-		preProcessor:     preProcess,
-	}
-}
-
-func (wh *hookSatisfactionChecker) Close() error {
-	return wh.preProcessor.Close()
-}
-
-type normalParam struct {
-	r io.Reader
-	h Header
-}
-
-type abnormalParam struct {
-	content io.ReadCloser
-	header  Header
-}
-
-type preProcessor struct {
-	config *parserConfig
-	offset int64
-	file   *os.File
-}
-
-var bufPool = sync.Pool{
-	New: func() interface{} {
-		return new(bytes.Buffer)
-	},
-}
-
-func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
-	buf, ok := bufPool.Get().(*bytes.Buffer)
-	if !ok {
-		buf = new(bytes.Buffer)
-	}
-	buf.Reset()
-
-	memLimit := min(pp.config.maxMemFileSize, pp.config.maxMemSize)
-	n, err := io.CopyN(buf, normalParam.r, int64(memLimit)+1)
-	if err != nil && !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("failed to copy: %w", err)
-	}
-
-	var content io.ReadCloser
-	if DataSize(n) > memLimit {
-		if pp.file == nil {
-			f, err := os.CreateTemp("", "formstream-")
-			if err != nil {
-				return nil, fmt.Errorf("failed to create temp file: %w", err)
-			}
-			pp.file = f
-		}
-
-		bufSize, err := io.Copy(pp.file, buf)
-		if err != nil {
-			return nil, fmt.Errorf("failed to write: %w", err)
-		}
-
-		remainSize, err := io.Copy(pp.file, normalParam.r)
-		if err != nil {
-			return nil, fmt.Errorf("failed to copy: %w", err)
-		}
-
-		size := bufSize + remainSize
-		content = io.NopCloser(io.NewSectionReader(pp.file, pp.offset, size))
-		pp.offset += size
-
-		bufPool.Put(buf)
-	} else {
-		pp.config.maxMemSize -= DataSize(buf.Len())
-		pp.config.maxMemFileSize -= DataSize(buf.Len())
-		bufSize := buf.Len()
-		content = customReadCloser{
-			Reader: buf,
-			closeFunc: func() error {
-				bufPool.Put(buf)
-				pp.config.maxMemSize += DataSize(bufSize)
-				pp.config.maxMemFileSize += DataSize(bufSize)
-				return nil
-			},
-		}
-	}
-
-	return &abnormalParam{
-		content: content,
-		header:  normalParam.h,
-	}, nil
-}
-
-func (pp *preProcessor) Close() error {
-	if pp.file == nil {
-		return nil
-	}
-
-	filepath := pp.file.Name()
-
-	// Close the file handle first
-	closeErr := pp.file.Close()
-
-	// Remove the temporary file from disk
-	removeErr := os.Remove(filepath)
-
-	// Return combined errors if any
-	if closeErr != nil || removeErr != nil {
-		return errors.Join(closeErr, removeErr)
-	}
-
-	return nil
-}
-
-type judgeHook struct {
-	fn           StreamHookFunc
-	requireParts []string
-}
-
-func (jh judgeHook) NormalPath(normalParam *normalParam) error {
-	return jh.fn(normalParam.r, normalParam.h)
-}
-
-func (jh judgeHook) AbnormalPath(abnoramlParam *abnormalParam) error {
-	defer abnoramlParam.content.Close()
-
-	return jh.fn(abnoramlParam.content, abnoramlParam.header)
-}
-
-func (jh judgeHook) Requirements() []string {
-	return jh.requireParts
-}
-
-type customReadCloser struct {
-	io.Reader
-	closeFunc func() error
-}
-
-func (cc customReadCloser) Close() error {
-	return cc.closeFunc()
 }
