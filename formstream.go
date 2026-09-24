@@ -1,14 +1,17 @@
 package formstream
 
 import (
+	"context"
 	"io"
 	"mime"
 	"net/textproto"
+	"sync"
 )
 
 type Parser struct {
 	boundary string
 	valueMap map[string][]Value
+	valueMu  sync.RWMutex
 	hookMap  map[string]streamHook
 	parserConfig
 }
@@ -37,6 +40,7 @@ type parserConfig struct {
 	maxHeaders     uint
 	maxMemSize     DataSize
 	maxMemFileSize DataSize
+	ctx            context.Context
 }
 
 type ParserOption func(*parserConfig)
@@ -86,6 +90,20 @@ func WithMaxMemSize(maxMemSize DataSize) ParserOption {
 func WithMaxMemFileSize(maxMemFileSize DataSize) ParserOption {
 	return func(c *parserConfig) {
 		c.maxMemFileSize = maxMemFileSize
+	}
+}
+
+// WithContext enables context-aware streaming parsing.
+//
+// Without it (or with a nil context) parsing stays on the single calling
+// goroutine exactly as before. With a non-nil context the part pump runs on a
+// producer goroutine and registered hooks run on the calling goroutine, so the
+// body is read with bounded in-flight buffering and cancellation propagates to
+// the producer. Cancelling ctx makes Parse return the context error (wrapped)
+// and guarantees the producer goroutine exits.
+func WithContext(ctx context.Context) ParserOption {
+	return func(c *parserConfig) {
+		c.ctx = ctx
 	}
 }
 

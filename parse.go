@@ -36,12 +36,24 @@ func (p *Parser) Parse(r io.Reader) (err error) {
 		}
 	}()
 
-	err = p.parse(r, hsc.IConditionJudger)
+	if p.ctx == nil {
+		return p.parse(r, hsc.IConditionJudger)
+	}
 
-	return
+	return p.parseAsync(r, hsc)
 }
 
-func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, *normalParam, *abnormalParam]) error {
+// hookExecutor is the subset of the condition judger the parse loop needs.
+// The synchronous implementation is conditionjudge.ConditionJudger itself;
+// the asynchronous one (asyncHookExecutor) routes hook invocations onto the
+// caller goroutine while keeping exactly the same parse loop and ordering.
+type hookExecutor interface {
+	IsHookExist(key string) bool
+	HookEvent(key string, value *normalParam) (bool, error)
+	KeyEvent(key string) error
+}
+
+func (p *Parser) parse(r io.Reader, hsc hookExecutor) error {
 	mr := multipart.NewReader(r, p.boundary)
 	for {
 		var part *multipart.Part
@@ -77,25 +89,29 @@ func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, 
 		} else {
 			b := new(bytes.Buffer)
 
-			if DataSize(len(part.FormName())) > p.maxMemSize {
+			remaining := p.maxMemSize - DataSize(len(part.FormName()))
+			if remaining < 0 {
 				return ErrTooLargeForm
 			}
-			p.maxMemSize -= DataSize(len(part.FormName()))
-
-			n, err := io.Copy(b, part)
-			if err != nil {
+			// Read at most remaining+1 bytes so an oversized form is detected
+			// while streaming instead of buffering the whole part in memory.
+			n, err := io.CopyN(b, io.MultiReader(part, bytes.NewReader(nil)), int64(remaining)+1)
+			if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 				return fmt.Errorf("failed to copy part: %w", err)
 			}
 
-			if uint64(n) > uint64(p.maxMemSize) {
+			if DataSize(n) > remaining {
 				return ErrTooLargeForm
 			}
-			p.maxMemSize -= DataSize(n)
 
+			p.maxMemSize -= DataSize(len(part.FormName())) + DataSize(n)
+
+			p.valueMu.Lock()
 			p.valueMap[part.FormName()] = append(p.valueMap[part.FormName()], Value{
 				content: b.Bytes(),
 				header:  header,
 			})
+			p.valueMu.Unlock()
 		}
 
 		err = hsc.KeyEvent(part.FormName())
@@ -116,6 +132,30 @@ func newHookSatisfactionChecker(streamHooks map[string]streamHook, config *parse
 	judgeHooks := make(map[string]conditionjudge.Hook[string, *normalParam, *abnormalParam], len(streamHooks))
 	for name, hook := range streamHooks {
 		h := judgeHook(hook)
+		judgeHooks[name] = &h
+	}
+
+	preProcess := &preProcessor{
+		config: config,
+	}
+
+	return &hookSatisfactionChecker{
+		IConditionJudger: conditionjudge.NewConditionJudger(judgeHooks, preProcess.run),
+		preProcessor:     preProcess,
+	}
+}
+
+// newAsyncHookSatisfactionChecker wires the same condition judger and
+// preProcessor into the asynchronous parse path. The judgement logic is shared;
+// only satisfied-hook invocation is replaced by dispatchHook so user hooks run
+// on the caller goroutine.
+func newAsyncHookSatisfactionChecker(streamHooks map[string]streamHook, config *parserConfig, dispatch dispatchHookFunc) *hookSatisfactionChecker {
+	judgeHooks := make(map[string]conditionjudge.Hook[string, *normalParam, *abnormalParam], len(streamHooks))
+	for name, hook := range streamHooks {
+		h := asyncJudgeHook{
+			judgeHook: judgeHook(hook),
+			dispatch:  dispatch,
+		}
 		judgeHooks[name] = &h
 	}
 
@@ -252,6 +292,18 @@ func (jh judgeHook) AbnormalPath(abnoramlParam *abnormalParam) error {
 
 func (jh judgeHook) Requirements() []string {
 	return jh.requireParts
+}
+
+// asyncJudgeHook shares the abnormal (spooled) path with judgeHook and only
+// overrides the normal (live streaming) path, which must run on the caller
+// goroutine via the bounded part pipe.
+type asyncJudgeHook struct {
+	judgeHook
+	dispatch dispatchHookFunc
+}
+
+func (jh asyncJudgeHook) NormalPath(param *normalParam) error {
+	return jh.dispatch(param)
 }
 
 type customReadCloser struct {
