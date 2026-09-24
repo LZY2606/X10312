@@ -2,6 +2,7 @@ package formstream
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"sync"
 
 	conditionjudge "github.com/mazrean/formstream/internal/condition_judge"
+	"github.com/mazrean/formstream/internal/streamx"
 )
 
 var (
@@ -22,7 +24,57 @@ var (
 )
 
 // Parse parses the multipart form from r.
-func (p *Parser) Parse(r io.Reader) (err error) {
+//
+// The whole form is not buffered: registered hook parts are streamed to the
+// hook under backpressure, and hooks waiting for required parts are served
+// from the bounded memory/temp-file buffer. Use ParseWithContext to cancel
+// parsing when a request context is done.
+func (p *Parser) Parse(r io.Reader) error {
+	return p.ParseWithContext(context.Background(), r)
+}
+
+// ParseWithContext behaves like Parse but stops producing as soon as ctx is
+// done. The context error (or its context.Cause) is preserved as the first
+// causal error.
+func (p *Parser) ParseWithContext(ctx context.Context, r io.Reader) (err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	// Plain io.Readers cannot be interrupted: if the producer is blocked
+	// inside Read when ctx is canceled, route reads through an io.Pipe whose
+	// writer is closed on cancellation so the producer goroutine exits.
+	// Background contexts (the common Parse path) bypass the bridge entirely.
+	parseReader := r
+	var pipeW *io.PipeWriter
+	var copierDone chan struct{}
+	if ctx.Done() != nil {
+		pipeR, pw := io.Pipe()
+		pipeW = pw
+		parseReader = pipeR
+		copierDone = make(chan struct{})
+		go func() {
+			defer close(copierDone)
+			_, copyErr := io.Copy(pw, r)
+			if copyErr == nil {
+				copyErr = io.EOF
+			}
+			_ = pw.CloseWithError(copyErr)
+		}()
+		stopAfterFunc := context.AfterFunc(ctx, func() {
+			_ = pw.CloseWithError(context.Cause(ctx))
+		})
+		defer func() {
+			stopAfterFunc()
+			// Only join the copier when cancellation was not the reason it
+			// was unblocked: a blocked reader may legally stay parked after
+			// its body is released by the surrounding request.
+			if ctx.Err() == nil {
+				<-copierDone
+			}
+		}()
+	}
+
 	hsc := newHookSatisfactionChecker(p.hookMap, &p.parserConfig)
 	defer func() {
 		deferErr := hsc.Close()
@@ -36,14 +88,27 @@ func (p *Parser) Parse(r io.Reader) (err error) {
 		}
 	}()
 
-	err = p.parse(r, hsc.IConditionJudger)
+	err = p.parse(ctx, parseReader, hsc.IConditionJudger)
+	if err != nil && ctx.Err() != nil {
+		// Cancellation is the caller-visible cause; keep it first.
+		if cause := context.Cause(ctx); cause != nil && !errors.Is(err, cause) {
+			err = errors.Join(cause, err)
+		}
+	}
 
 	return
 }
 
-func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, *normalParam, *abnormalParam]) error {
+func (p *Parser) parse(ctx context.Context, r io.Reader, hsc conditionjudge.IConditionJudger[string, *normalParam, *abnormalParam]) error {
 	mr := multipart.NewReader(r, p.boundary)
 	for {
+		if err := ctx.Err(); err != nil {
+			if cause := context.Cause(ctx); cause != nil {
+				return cause
+			}
+			return err
+		}
+
 		var part *multipart.Part
 		part, err := mr.NextPart()
 		if err != nil {
@@ -67,12 +132,26 @@ func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, 
 
 		header := newHeader(part.Header)
 		if hsc.IsHookExist(part.FormName()) {
-			_, err := hsc.HookEvent(part.FormName(), &normalParam{
-				r: part,
-				h: header,
-			})
-			if err != nil {
-				return fmt.Errorf("failed to run or set hook: %w", err)
+			bodyStream := streamx.New(part, ctx)
+			hookErr := func() error {
+				_, hookErr := hsc.HookEvent(part.FormName(), &normalParam{
+					r: bodyStream,
+					h: header,
+				})
+				return hookErr
+			}()
+			if hookErr != nil {
+				// Hook (or reader/context) failed: stop producing at once.
+				bodyStream.Cancel()
+				bodyStream.Finish()
+				return fmt.Errorf("failed to run or set hook: %w", hookErr)
+			}
+			// Hook succeeded, possibly after reading only a prefix: finish
+			// drains the remainder on the producer goroutine and reclaims
+			// every chunk before the next part is read.
+			bodyStream.Finish()
+			if err := bodyStream.Err(); err != nil {
+				return fmt.Errorf("failed to read hook part: %w", err)
 			}
 		} else {
 			b := new(bytes.Buffer)
