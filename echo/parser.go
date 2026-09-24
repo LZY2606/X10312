@@ -1,6 +1,7 @@
 package echoform
 
 import (
+	"context"
 	"errors"
 	"io"
 	"mime"
@@ -36,8 +37,16 @@ func NewParser(c echo.Context, options ...formstream.ParserOption) (*Parser, err
 // Parse parses the request body.
 // It returns the echo.HTTPError if the hook function returns an echo.HTTPError.
 func (p *Parser) Parse() error {
-	err := p.Parser.Parse(p.reader)
+	return p.parseWith(p.Parser.Parse(p.reader))
+}
 
+// ParseContext parses the request body, aborting when ctx is canceled.
+// It returns the echo.HTTPError if the hook function returns an echo.HTTPError.
+func (p *Parser) ParseContext(ctx context.Context) error {
+	return p.parseWith(p.Parser.ParseContext(ctx, p.reader))
+}
+
+func (p *Parser) parseWith(err error) error {
 	var httpErr *echo.HTTPError
 	if errors.As(err, &httpErr) {
 		return httpErr

@@ -2,12 +2,14 @@ package formstream
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
 	"os"
 	"sync"
+	"sync/atomic"
 
 	conditionjudge "github.com/mazrean/formstream/internal/condition_judge"
 )
@@ -23,6 +25,17 @@ var (
 
 // Parse parses the multipart form from r.
 func (p *Parser) Parse(r io.Reader) (err error) {
+	return p.ParseContext(context.Background(), r)
+}
+
+// ParseContext behaves like [Parser.Parse], but aborts as soon as ctx is
+// canceled. When parsing is aborted for any reason (hook error, malformed
+// input, budget exhaustion or cancellation), r is closed if it implements
+// io.Closer, so that a producer goroutine writing to r cannot outlive the
+// parse call. The first causal error is always preserved: cancellation is
+// reported as ctx.Err(), while an earlier hook or reader error keeps
+// precedence.
+func (p *Parser) ParseContext(ctx context.Context, r io.Reader) (err error) {
 	hsc := newHookSatisfactionChecker(p.hookMap, &p.parserConfig)
 	defer func() {
 		deferErr := hsc.Close()
@@ -36,9 +49,67 @@ func (p *Parser) Parse(r io.Reader) (err error) {
 		}
 	}()
 
-	err = p.parse(r, hsc.IConditionJudger)
+	// Background-like contexts never fire, so avoid the watcher overhead on
+	// the hot path. For cancellable contexts, closing the source unblocks a
+	// Read currently waiting on a slow producer; the stop channel reaps the
+	// watcher when parsing finishes before cancellation.
+	if ctx.Done() != nil {
+		stop := make(chan struct{})
+		defer close(stop)
+		go func() {
+			select {
+			case <-ctx.Done():
+				if c, ok := r.(io.Closer); ok {
+					_ = c.Close()
+				}
+			case <-stop:
+			}
+		}()
+	}
+
+	// On failure, release the source so a streaming producer (io.Pipe writer,
+	// HTTP request body uploader, ...) is unblocked instead of leaking the
+	// goroutine. Successful parses consume the whole stream as before.
+	defer func() {
+		if err != nil {
+			if c, ok := r.(io.Closer); ok {
+				_ = c.Close()
+			}
+		}
+	}()
+
+	err = p.parse(newContextReader(ctx, r), hsc.IConditionJudger)
 
 	return
+}
+
+// contextReader turns context cancellation into a read error while leaving
+// all other reads byte-identical to the production source.
+type contextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func newContextReader(ctx context.Context, r io.Reader) io.Reader {
+	if ctx.Done() == nil {
+		return r
+	}
+	return &contextReader{ctx: ctx, r: r}
+}
+
+func (cr *contextReader) Read(p []byte) (int, error) {
+	if err := cr.ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	n, err := cr.r.Read(p)
+	// A blocked read can only notice cancellation when the watcher closes the
+	// source. Surface the cancellation itself so the causal error survives.
+	if cerr := cr.ctx.Err(); cerr != nil {
+		return n, cerr
+	}
+
+	return n, err
 }
 
 func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, *normalParam, *abnormalParam]) error {
@@ -147,6 +218,10 @@ type preProcessor struct {
 	config *parserConfig
 	offset int64
 	file   *os.File
+	// pending keeps memory-spooled contents that have not been handed to a
+	// hook yet. They must be released even when parsing aborts, otherwise the
+	// pooled buffer and the consumed memory budget leak past a failed parse.
+	pending []*pendingMemory
 }
 
 var bufPool = sync.Pool{
@@ -165,6 +240,7 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 	memLimit := min(pp.config.maxMemFileSize, pp.config.maxMemSize)
 	n, err := io.CopyN(buf, normalParam.r, int64(memLimit)+1)
 	if err != nil && !errors.Is(err, io.EOF) {
+		bufPool.Put(buf)
 		return nil, fmt.Errorf("failed to copy: %w", err)
 	}
 
@@ -180,11 +256,13 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 
 		bufSize, err := io.Copy(pp.file, buf)
 		if err != nil {
+			bufPool.Put(buf)
 			return nil, fmt.Errorf("failed to write: %w", err)
 		}
 
 		remainSize, err := io.Copy(pp.file, normalParam.r)
 		if err != nil {
+			bufPool.Put(buf)
 			return nil, fmt.Errorf("failed to copy: %w", err)
 		}
 
@@ -197,14 +275,17 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 		pp.config.maxMemSize -= DataSize(buf.Len())
 		pp.config.maxMemFileSize -= DataSize(buf.Len())
 		bufSize := buf.Len()
-		content = customReadCloser{
-			Reader: buf,
-			closeFunc: func() error {
+		mem := &pendingMemory{
+			release: func() {
 				bufPool.Put(buf)
 				pp.config.maxMemSize += DataSize(bufSize)
 				pp.config.maxMemFileSize += DataSize(bufSize)
-				return nil
 			},
+		}
+		pp.pending = append(pp.pending, mem)
+		content = customReadCloser{
+			Reader:    buf,
+			closeFunc: func() error { mem.Release(); return nil },
 		}
 	}
 
@@ -215,6 +296,14 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 }
 
 func (pp *preProcessor) Close() error {
+	// Release any memory-spooled parts which never reached a hook because
+	// parsing was aborted. Successful hooks close their own content, so only
+	// still-open parts are present here.
+	for _, mem := range pp.pending {
+		mem.Release()
+	}
+	pp.pending = nil
+
 	if pp.file == nil {
 		return nil
 	}
@@ -261,4 +350,19 @@ type customReadCloser struct {
 
 func (cc customReadCloser) Close() error {
 	return cc.closeFunc()
+}
+
+// pendingMemory reclaims a memory-spooled part which never reached a hook
+// because parsing was aborted. Release is idempotent: the hook closes the
+// content on the completion path and preProcessor.Close runs on the abort
+// path, but only one of them reclaims the same part.
+type pendingMemory struct {
+	release func()
+	closed  atomic.Bool
+}
+
+func (m *pendingMemory) Release() {
+	if m.closed.CompareAndSwap(false, true) {
+		m.release()
+	}
 }
