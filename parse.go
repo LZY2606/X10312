@@ -2,6 +2,7 @@ package formstream
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -22,7 +23,29 @@ var (
 )
 
 // Parse parses the multipart form from r.
-func (p *Parser) Parse(r io.Reader) (err error) {
+func (p *Parser) Parse(r io.Reader) error {
+	return p.ParseContext(context.Background(), r)
+}
+
+// ParseContext parses the multipart form from r.
+// If ctx is canceled, parsing aborts at the next read and the returned error
+// preserves ctx.Err() as its causal error. Cancellation is cooperative: it is
+// observed between reads of r, so a Read blocked inside r cannot be
+// interrupted until r itself returns.
+//
+// Both the resource budgets (parts, headers, memory) and the parsed values
+// are scoped to a single ParseContext call: budgets consumed by the call are
+// returned when it ends, and a failed call never leaves partial values for a
+// later successful call.
+func (p *Parser) ParseContext(ctx context.Context, r io.Reader) (err error) {
+	// The parse loop and the preProcessor mutate parserConfig while parsing.
+	// Save and restore it so a failed or successful call does not shrink the
+	// budgets of subsequent calls (a retry with identical input must be stable).
+	savedConfig := p.parserConfig
+	defer func() {
+		p.parserConfig = savedConfig
+	}()
+
 	hsc := newHookSatisfactionChecker(p.hookMap, &p.parserConfig)
 	defer func() {
 		deferErr := hsc.Close()
@@ -36,9 +59,40 @@ func (p *Parser) Parse(r io.Reader) (err error) {
 		}
 	}()
 
-	err = p.parse(r, hsc.IConditionJudger)
+	// Values are scoped to this call: never carry values (including the
+	// partial values left by a failed call) into the next successful result.
+	p.valueMap = make(map[string][]Value)
+
+	err = p.parse(newContextReader(ctx, r), hsc.IConditionJudger)
 
 	return
+}
+
+// contextReader makes context cancellation observable through the same read
+// path as I/O failures, so cancellation and reader errors share one causal
+// error chain instead of a separate control flow.
+type contextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func newContextReader(ctx context.Context, r io.Reader) io.Reader {
+	if ctx.Done() == nil {
+		return r
+	}
+
+	return &contextReader{
+		ctx: ctx,
+		r:   r,
+	}
+}
+
+func (cr *contextReader) Read(p []byte) (int, error) {
+	if err := cr.ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	return cr.r.Read(p)
 }
 
 func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, *normalParam, *abnormalParam]) error {
@@ -109,6 +163,7 @@ func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, 
 
 type hookSatisfactionChecker struct {
 	conditionjudge.IConditionJudger[string, *normalParam, *abnormalParam]
+	judger       *conditionjudge.ConditionJudger[string, *normalParam, *abnormalParam]
 	preProcessor *preProcessor
 }
 
@@ -122,14 +177,28 @@ func newHookSatisfactionChecker(streamHooks map[string]streamHook, config *parse
 	preProcess := &preProcessor{
 		config: config,
 	}
+	judger := conditionjudge.NewConditionJudger(judgeHooks, preProcess.run)
 
 	return &hookSatisfactionChecker{
-		IConditionJudger: conditionjudge.NewConditionJudger(judgeHooks, preProcess.run),
+		IConditionJudger: judger,
+		judger:           judger,
 		preProcessor:     preProcess,
 	}
 }
 
+// Close releases every resource held by the parse call. It closes contents
+// already pre-processed for hooks whose requirements were never met, then
+// closes the shared temporary file (if any).
 func (wh *hookSatisfactionChecker) Close() error {
+	var err error
+	for _, param := range wh.judger.RemainingParams() {
+		err = errors.Join(err, param.content.Close())
+	}
+
+	return errors.Join(err, wh.preProcessor.Close())
+}
+
+func (wh *hookSatisfactionChecker) closePreProcessor() error {
 	return wh.preProcessor.Close()
 }
 
@@ -165,6 +234,7 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 	memLimit := min(pp.config.maxMemFileSize, pp.config.maxMemSize)
 	n, err := io.CopyN(buf, normalParam.r, int64(memLimit)+1)
 	if err != nil && !errors.Is(err, io.EOF) {
+		bufPool.Put(buf)
 		return nil, fmt.Errorf("failed to copy: %w", err)
 	}
 
@@ -173,6 +243,7 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 		if pp.file == nil {
 			f, err := os.CreateTemp("", "formstream-")
 			if err != nil {
+				bufPool.Put(buf)
 				return nil, fmt.Errorf("failed to create temp file: %w", err)
 			}
 			pp.file = f
@@ -180,11 +251,13 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 
 		bufSize, err := io.Copy(pp.file, buf)
 		if err != nil {
+			bufPool.Put(buf)
 			return nil, fmt.Errorf("failed to write: %w", err)
 		}
 
 		remainSize, err := io.Copy(pp.file, normalParam.r)
 		if err != nil {
+			bufPool.Put(buf)
 			return nil, fmt.Errorf("failed to copy: %w", err)
 		}
 
