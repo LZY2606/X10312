@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"mime/multipart"
 	"os"
 	"sync"
@@ -22,9 +23,21 @@ var (
 )
 
 // Parse parses the multipart form from r.
+// Resource budgets (max parts, headers and memory) are scoped to a single
+// call, and values parsed by a failed call are rolled back, so a failed
+// Parse never leaks counters, caches or temporary state into the next call.
 func (p *Parser) Parse(r io.Reader) (err error) {
+	savedConfig := p.parserConfig
+	savedValueMap := p.valueMap
+	p.valueMap = maps.Clone(p.valueMap)
+
 	hsc := newHookSatisfactionChecker(p.hookMap, &p.parserConfig)
 	defer func() {
+		p.parserConfig = savedConfig
+		if err != nil {
+			p.valueMap = savedValueMap
+		}
+
 		deferErr := hsc.Close()
 		// capture the error of Close()
 		if deferErr != nil {
