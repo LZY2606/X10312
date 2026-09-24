@@ -23,6 +23,14 @@ var (
 
 // Parse parses the multipart form from r.
 func (p *Parser) Parse(r io.Reader) (err error) {
+	// Budgets (maxParts/maxHeaders/maxMemSize/maxMemFileSize) are consumed
+	// during a single Parse run. Snapshot and restore them so that a failed
+	// or finished Parse never leaks counter state into subsequent Parse calls.
+	config := p.parserConfig
+	defer func() {
+		p.parserConfig = config
+	}()
+
 	hsc := newHookSatisfactionChecker(p.hookMap, &p.parserConfig)
 	defer func() {
 		deferErr := hsc.Close()
