@@ -1,6 +1,7 @@
 package ginform
 
 import (
+	"context"
 	"io"
 	"mime"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 type Parser struct {
 	*formstream.Parser
 	reader io.Reader
+	ctx    context.Context
 }
 
 func NewParser(c *gin.Context, options ...formstream.ParserOption) (*Parser, error) {
@@ -34,5 +36,5 @@ func NewParser(c *gin.Context, options ...formstream.ParserOption) (*Parser, err
 
 // Parse parses the request body.
 func (p *Parser) Parse() error {
-	return p.Parser.Parse(p.reader)
+	return p.Parser.ParseContext(p.ctx, p.reader)
 }

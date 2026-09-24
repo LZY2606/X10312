@@ -11,16 +11,29 @@ type IConditionJudger[K comparable, S any, T any] interface {
 	KeyEvent(key K) error
 }
 
-// ConditionJudger If the condition is met, execute immediately; if not, wait until it is met and execute.
+// ConditionJudger If the condition is met, execute immediately; if not, wait until it is met and then execute.
 type ConditionJudger[K comparable, S any, T any] struct {
 	// preProcessFunc Convert value conversions when conditions are not met
 	preProcessFunc     PreProcessFunc[S, T]
 	satisfiedHookMap   map[K]func(S) error
 	unsatisfiedHookMap map[K]*waitHook[K, S, T]
 	requirementHookMap map[K][]*waitHook[K, S, T]
+	closeFunc          func(T) error
 }
 
 type PreProcessFunc[S any, T any] func(S) (T, error)
+
+// Option customizes a ConditionJudger.
+type Option[K comparable, S any, T any] func(*ConditionJudger[K, S, T])
+
+// WithCloseFunc registers a function invoked for every pre-processed value
+// that never reached a hook when Close is called. It guarantees resources
+// produced by PreProcessFunc are released even when parsing aborts early.
+func WithCloseFunc[K comparable, S any, T any](fn func(T) error) Option[K, S, T] {
+	return func(w *ConditionJudger[K, S, T]) {
+		w.closeFunc = fn
+	}
+}
 
 type waitHook[K comparable, S any, T any] struct {
 	key              K
@@ -36,7 +49,7 @@ type Hook[K comparable, S any, T any] interface {
 	Requirements() []K
 }
 
-func NewConditionJudger[K comparable, S any, T any](hookMap map[K]Hook[K, S, T], prepreProcessFunc PreProcessFunc[S, T]) *ConditionJudger[K, S, T] {
+func NewConditionJudger[K comparable, S any, T any](hookMap map[K]Hook[K, S, T], prepreProcessFunc PreProcessFunc[S, T], opts ...Option[K, S, T]) *ConditionJudger[K, S, T] {
 	satisfiedHookMap := make(map[K]func(S) error, len(hookMap))
 	unsatisfiedHookMap := make(map[K]*waitHook[K, S, T])
 	requirementHookMap := make(map[K][]*waitHook[K, S, T])
@@ -60,12 +73,38 @@ func NewConditionJudger[K comparable, S any, T any](hookMap map[K]Hook[K, S, T],
 		}
 	}
 
-	return &ConditionJudger[K, S, T]{
+	w := &ConditionJudger[K, S, T]{
 		preProcessFunc:     prepreProcessFunc,
 		satisfiedHookMap:   satisfiedHookMap,
 		unsatisfiedHookMap: unsatisfiedHookMap,
 		requirementHookMap: requirementHookMap,
 	}
+
+	for _, opt := range opts {
+		opt(w)
+	}
+
+	return w
+}
+
+// Close releases pre-processed values still buffered for hooks whose
+// requirements were never satisfied.
+func (w *ConditionJudger[K, S, T]) Close() error {
+	if w.closeFunc == nil {
+		return nil
+	}
+
+	var errs []error
+	for _, hook := range w.unsatisfiedHookMap {
+		for _, param := range hook.callParams {
+			if err := w.closeFunc(param); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		hook.callParams = nil
+	}
+
+	return errors.Join(errs...)
 }
 
 func (w *ConditionJudger[K, S, T]) IsHookExist(key K) bool {

@@ -2,14 +2,16 @@ package formstream
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
 	"os"
-	"sync"
 
+	"github.com/mazrean/formstream/internal/bufpool"
 	conditionjudge "github.com/mazrean/formstream/internal/condition_judge"
+	"github.com/mazrean/formstream/internal/pump"
 )
 
 var (
@@ -23,7 +25,31 @@ var (
 
 // Parse parses the multipart form from r.
 func (p *Parser) Parse(r io.Reader) (err error) {
+	return p.ParseContext(context.Background(), r)
+}
+
+// ParseContext parses the multipart form from r.
+//
+// The body is pumped through a bounded producer goroutine so that slow
+// consumers never buffer the whole request. When ctx is canceled, the
+// producer is stopped (closing r as well when it implements io.Closer) and
+// the first causal error is preserved.
+func (p *Parser) ParseContext(ctx context.Context, r io.Reader) (err error) {
 	hsc := newHookSatisfactionChecker(p.hookMap, &p.parserConfig)
+	pm := pump.New(ctx, r)
+
+	defer func() {
+		stopCause := err
+		if stopCause == nil {
+			// Even on the successful path the source must be closed when it is
+			// a Closer: the producer may have a trailing blocked Read (for
+			// example request bodies behind a server). Closing unblocks it and
+			// guarantees no goroutine escapes.
+			stopCause = io.EOF
+		}
+		pm.Stop(stopCause)
+	}()
+
 	defer func() {
 		deferErr := hsc.Close()
 		// capture the error of Close()
@@ -36,7 +62,7 @@ func (p *Parser) Parse(r io.Reader) (err error) {
 		}
 	}()
 
-	err = p.parse(r, hsc.IConditionJudger)
+	err = p.parse(pm.Reader(), hsc)
 
 	return
 }
@@ -75,27 +101,10 @@ func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, 
 				return fmt.Errorf("failed to run or set hook: %w", err)
 			}
 		} else {
-			b := new(bytes.Buffer)
-
-			if DataSize(len(part.FormName())) > p.maxMemSize {
-				return ErrTooLargeForm
-			}
-			p.maxMemSize -= DataSize(len(part.FormName()))
-
-			n, err := io.Copy(b, part)
+			err = p.consumeValue(part, header)
 			if err != nil {
-				return fmt.Errorf("failed to copy part: %w", err)
+				return err
 			}
-
-			if uint64(n) > uint64(p.maxMemSize) {
-				return ErrTooLargeForm
-			}
-			p.maxMemSize -= DataSize(n)
-
-			p.valueMap[part.FormName()] = append(p.valueMap[part.FormName()], Value{
-				content: b.Bytes(),
-				header:  header,
-			})
 		}
 
 		err = hsc.KeyEvent(part.FormName())
@@ -107,8 +116,35 @@ func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, 
 	return nil
 }
 
+func (p *Parser) consumeValue(part *multipart.Part, header Header) (err error) {
+	b := bufpool.Default.Get()
+	defer bufpool.Default.Put(b)
+
+	if DataSize(len(part.FormName())) > p.maxMemSize {
+		return ErrTooLargeForm
+	}
+	p.maxMemSize -= DataSize(len(part.FormName()))
+
+	n, err := io.Copy(b, part)
+	if err != nil {
+		return fmt.Errorf("failed to copy part: %w", err)
+	}
+
+	if uint64(n) > uint64(p.maxMemSize) {
+		return ErrTooLargeForm
+	}
+	p.maxMemSize -= DataSize(n)
+
+	p.valueMap[part.FormName()] = append(p.valueMap[part.FormName()], Value{
+		content: bytes.Clone(b.Bytes()),
+		header:  header,
+	})
+
+	return nil
+}
+
 type hookSatisfactionChecker struct {
-	conditionjudge.IConditionJudger[string, *normalParam, *abnormalParam]
+	*conditionjudge.ConditionJudger[string, *normalParam, *abnormalParam]
 	preProcessor *preProcessor
 }
 
@@ -123,14 +159,25 @@ func newHookSatisfactionChecker(streamHooks map[string]streamHook, config *parse
 		config: config,
 	}
 
+	judger := conditionjudge.NewConditionJudger(
+		judgeHooks,
+		preProcess.run,
+		conditionjudge.WithCloseFunc[string, *normalParam, *abnormalParam](func(param *abnormalParam) error {
+			return param.content.Close()
+		}),
+	)
+
 	return &hookSatisfactionChecker{
-		IConditionJudger: conditionjudge.NewConditionJudger(judgeHooks, preProcess.run),
-		preProcessor:     preProcess,
+		ConditionJudger: judger,
+		preProcessor:    preProcess,
 	}
 }
 
 func (wh *hookSatisfactionChecker) Close() error {
-	return wh.preProcessor.Close()
+	return errors.Join(
+		wh.ConditionJudger.Close(),
+		wh.preProcessor.Close(),
+	)
 }
 
 type normalParam struct {
@@ -149,39 +196,33 @@ type preProcessor struct {
 	file   *os.File
 }
 
-var bufPool = sync.Pool{
-	New: func() interface{} {
-		return new(bytes.Buffer)
-	},
-}
-
 func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
-	buf, ok := bufPool.Get().(*bytes.Buffer)
-	if !ok {
-		buf = new(bytes.Buffer)
-	}
-	buf.Reset()
+	buf := bufpool.Default.Get()
 
 	memLimit := min(pp.config.maxMemFileSize, pp.config.maxMemSize)
 	n, err := io.CopyN(buf, normalParam.r, int64(memLimit)+1)
 	if err != nil && !errors.Is(err, io.EOF) {
+		bufpool.Default.Put(buf)
 		return nil, fmt.Errorf("failed to copy: %w", err)
 	}
 
 	var content io.ReadCloser
 	if DataSize(n) > memLimit {
 		if pp.file == nil {
-			f, err := os.CreateTemp("", "formstream-")
-			if err != nil {
-				return nil, fmt.Errorf("failed to create temp file: %w", err)
+			f, createErr := os.CreateTemp("", "formstream-")
+			if createErr != nil {
+				bufpool.Default.Put(buf)
+				return nil, fmt.Errorf("failed to create temp file: %w", createErr)
 			}
 			pp.file = f
 		}
 
 		bufSize, err := io.Copy(pp.file, buf)
 		if err != nil {
+			bufpool.Default.Put(buf)
 			return nil, fmt.Errorf("failed to write: %w", err)
 		}
+		bufpool.Default.Put(buf)
 
 		remainSize, err := io.Copy(pp.file, normalParam.r)
 		if err != nil {
@@ -191,16 +232,15 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 		size := bufSize + remainSize
 		content = io.NopCloser(io.NewSectionReader(pp.file, pp.offset, size))
 		pp.offset += size
-
-		bufPool.Put(buf)
 	} else {
 		pp.config.maxMemSize -= DataSize(buf.Len())
 		pp.config.maxMemFileSize -= DataSize(buf.Len())
 		bufSize := buf.Len()
+		data := bytes.Clone(buf.Bytes())
+		bufpool.Default.Put(buf)
 		content = customReadCloser{
-			Reader: buf,
+			Reader: bytes.NewReader(data),
 			closeFunc: func() error {
-				bufPool.Put(buf)
 				pp.config.maxMemSize += DataSize(bufSize)
 				pp.config.maxMemFileSize += DataSize(bufSize)
 				return nil
