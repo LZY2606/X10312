@@ -2,6 +2,7 @@ package formstream
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -22,7 +23,24 @@ var (
 )
 
 // Parse parses the multipart form from r.
-func (p *Parser) Parse(r io.Reader) (err error) {
+// It is equivalent to [Parser.ParseWithContext] with [context.Background].
+func (p *Parser) Parse(r io.Reader) error {
+	return p.ParseWithContext(context.Background(), r)
+}
+
+// ParseWithContext parses the multipart form from r.
+//
+// The context only governs cancellation: when ctx is canceled, in-flight
+// reads are unblocked and the context's error is preserved as the first
+// cause. When parsing terminates because of any error (including a hook
+// error, a reader error or cancellation), r is closed when it implements
+// [io.Closer]. On success r is left open, following the net/http convention
+// where the caller owns the request body.
+func (p *Parser) ParseWithContext(ctx context.Context, r io.Reader) (err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	hsc := newHookSatisfactionChecker(p.hookMap, &p.parserConfig)
 	defer func() {
 		deferErr := hsc.Close()
@@ -36,7 +54,17 @@ func (p *Parser) Parse(r io.Reader) (err error) {
 		}
 	}()
 
-	err = p.parse(r, hsc.IConditionJudger)
+	source := r
+	var cancelable *cancelableReader
+	if ctx.Done() != nil {
+		cancelable = newCancelableReader(ctx, r)
+		defer func() {
+			cancelable.release(err == nil)
+		}()
+		source = cancelable
+	}
+
+	err = p.parse(source, hsc.IConditionJudger)
 
 	return
 }
@@ -131,6 +159,70 @@ func newHookSatisfactionChecker(streamHooks map[string]streamHook, config *parse
 
 func (wh *hookSatisfactionChecker) Close() error {
 	return wh.preProcessor.Close()
+}
+
+// cancelableReader bridges context cancellation to a synchronous reader.
+//
+// The parser reads from a single goroutine. When the context is canceled,
+// the watcher closes the underlying reader (when it implements
+// [io.Closer]); this unblocks any in-flight read performed by a producer on
+// the other end (e.g. a request body being uploaded) so that goroutine can
+// exit. The watcher itself exits as soon as reading finishes.
+type cancelableReader struct {
+	ctx    context.Context
+	r      io.Reader
+	closer io.Closer
+	stop   chan struct{}
+}
+
+func newCancelableReader(ctx context.Context, r io.Reader) *cancelableReader {
+	cr := &cancelableReader{
+		ctx:  ctx,
+		r:    r,
+		stop: make(chan struct{}),
+	}
+	if closer, ok := r.(io.Closer); ok {
+		cr.closer = closer
+	}
+	if cr.closer != nil {
+		go cr.watch()
+	}
+	return cr
+}
+
+func (cr *cancelableReader) watch() {
+	select {
+	case <-cr.ctx.Done():
+		// Unblock any in-flight read so the producer can exit.
+		_ = cr.closer.Close()
+	case <-cr.stop:
+	}
+}
+
+func (cr *cancelableReader) Read(p []byte) (int, error) {
+	// Fail fast if the context is already canceled.
+	if err := cr.ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	n, err := cr.r.Read(p)
+	// A cancellation wins over a concurrent read error (such as the error
+	// caused by closing the reader) so the first causal error is preserved.
+	if ctxErr := cr.ctx.Err(); ctxErr != nil {
+		return n, ctxErr
+	}
+	return n, err
+}
+
+// release stops the watcher and, on failure, closes the source. Closing the
+// body after an aborted parse is the net/http convention and guarantees a
+// producer blocked on writing the remaining body is released. On success the
+// source is left for the caller to close.
+func (cr *cancelableReader) release(success bool) {
+	close(cr.stop)
+	if !success && cr.closer != nil {
+		_ = cr.closer.Close()
+	}
 }
 
 type normalParam struct {
