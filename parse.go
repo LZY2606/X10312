@@ -2,6 +2,7 @@ package formstream
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -22,7 +23,27 @@ var (
 )
 
 // Parse parses the multipart form from r.
-func (p *Parser) Parse(r io.Reader) (err error) {
+func (p *Parser) Parse(r io.Reader) error {
+	return p.ParseContext(context.Background(), r)
+}
+
+// ParseContext parses the multipart form from r.
+//
+// The context governs the lifetime of the parsing goroutines: if ctx is
+// canceled while the parser is blocked reading from r, the parse is aborted
+// and the context error is reported (joined after any earlier causal error).
+// Parsing is performed incrementally without buffering the whole form: hook
+// readers are fed straight from the form stream, and only non-hook fields and
+// pre-processed (deferred) parts occupy memory or temporary storage.
+//
+// ParseContext always waits for all goroutines it started to exit before
+// returning, and releases every pre-processed part that was not consumed by a
+// hook, so no pooled buffer, memory budget or temporary file outlives the call.
+func (p *Parser) ParseContext(ctx context.Context, r io.Reader) (err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	hsc := newHookSatisfactionChecker(p.hookMap, &p.parserConfig)
 	defer func() {
 		deferErr := hsc.Close()
@@ -36,9 +57,128 @@ func (p *Parser) Parse(r io.Reader) (err error) {
 		}
 	}()
 
-	err = p.parse(r, hsc.IConditionJudger)
+	// A pipe is the single handoff point of the production path: the
+	// multipart reader consumes pr, while the feeder goroutine copies the
+	// caller's reader into pw. Closing pw with an error makes every blocked
+	// read (including a hook mid-part) fail immediately, which guarantees
+	// that the parsing goroutine exits on reader failure, consumer stop or
+	// context cancellation.
+	pr, pw := io.Pipe()
+	parseDone := make(chan struct{})
+
+	var (
+		wg        sync.WaitGroup
+		abortOnce sync.Once
+		abortErr  error
+	)
+	abort := func(cause error) {
+		abortOnce.Do(func() {
+			abortErr = cause
+			closePipeWithCause(pw, cause)
+			// Unblock a feeder that is stuck writing into the pipe, and a
+			// source read whose Reader supports interruption.
+			if c, ok := r.(io.Closer); ok {
+				_ = c.Close()
+			}
+		})
+	}
+
+	// watcher unblocks the pipeline when ctx is done; it exits as soon as
+	// parsing finishes.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		select {
+		case <-ctx.Done():
+			abort(ctx.Err())
+		case <-parseDone:
+		}
+	}()
+
+	// feeder is the producer side of the stream: it copies r into pw
+	// incrementally (fixed-size copy buffer), so the whole form is never held
+	// in memory. A read error from r becomes the causal error of the stream.
+	var feederErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 32*1024)
+		for {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				abort(ctxErr)
+				return
+			}
+
+			n, readErr := r.Read(buf)
+			if n > 0 {
+				if _, writeErr := pw.Write(buf[:n]); writeErr != nil {
+					// The parser side closed the pipe (consumer stop / parse
+					// failure). Stop producing; this is not a causal error.
+					return
+				}
+			}
+			if readErr != nil {
+				if errors.Is(readErr, io.EOF) {
+					_ = pw.Close()
+					return
+				}
+				feederErr = readErr
+				abort(fmt.Errorf("failed to read form: %w", readErr))
+				return
+			}
+		}
+	}()
+
+	var parseErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(parseDone)
+		defer func() {
+			// The parsing goroutine is the single owner of the checker; any
+			// exit other than a clean EOF aborts the stream so that blocked
+			// feeder/watcher goroutines unblock.
+			if parseErr != nil {
+				abort(parseErr)
+			} else {
+				_ = pw.Close()
+			}
+		}()
+		parseErr = p.parse(pr, hsc.IConditionJudger)
+	}()
+
+	wg.Wait()
+
+	// Prefer the first causal error. The parsing error preserves the error
+	// layering (sentinel errors stay errors.Is-able); the source read error is
+	// only surfaced when parsing itself did not fail, and context cancellation
+	// is joined rather than replacing the cause.
+	if parseErr != nil {
+		err = parseErr
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			err = errors.Join(err, ctxErr)
+		}
+		return
+	}
+	if abortErr != nil && !errors.Is(abortErr, context.Canceled) && !errors.Is(abortErr, context.DeadlineExceeded) {
+		err = abortErr
+		return
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		err = ctxErr
+		return
+	}
+	err = feederErr
 
 	return
+}
+
+func closePipeWithCause(pw *io.PipeWriter, cause error) {
+	if cause == nil {
+		_ = pw.Close()
+		return
+	}
+	_ = pw.CloseWithError(cause)
 }
 
 func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, *normalParam, *abnormalParam]) error {
@@ -113,14 +253,19 @@ type hookSatisfactionChecker struct {
 }
 
 func newHookSatisfactionChecker(streamHooks map[string]streamHook, config *parserConfig) *hookSatisfactionChecker {
-	judgeHooks := make(map[string]conditionjudge.Hook[string, *normalParam, *abnormalParam], len(streamHooks))
-	for name, hook := range streamHooks {
-		h := judgeHook(hook)
-		judgeHooks[name] = &h
+	preProcess := &preProcessor{
+		config:         config,
+		pendingContent: make(map[*abnormalParam]struct{}),
 	}
 
-	preProcess := &preProcessor{
-		config: config,
+	judgeHooks := make(map[string]conditionjudge.Hook[string, *normalParam, *abnormalParam], len(streamHooks))
+	for name, hook := range streamHooks {
+		h := judgeHook{
+			fn:           hook.fn,
+			requireParts: hook.requireParts,
+			preProcessor: preProcess,
+		}
+		judgeHooks[name] = &h
 	}
 
 	return &hookSatisfactionChecker{
@@ -147,6 +292,10 @@ type preProcessor struct {
 	config *parserConfig
 	offset int64
 	file   *os.File
+	// pendingContent tracks every pre-processed part whose AbnormalPath has
+	// not run yet, so buffers and temporary-file sections are released even
+	// when parsing stops before the deferred hook becomes satisfiable.
+	pendingContent map[*abnormalParam]struct{}
 }
 
 var bufPool = sync.Pool{
@@ -165,6 +314,7 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 	memLimit := min(pp.config.maxMemFileSize, pp.config.maxMemSize)
 	n, err := io.CopyN(buf, normalParam.r, int64(memLimit)+1)
 	if err != nil && !errors.Is(err, io.EOF) {
+		bufPool.Put(buf)
 		return nil, fmt.Errorf("failed to copy: %w", err)
 	}
 
@@ -173,6 +323,7 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 		if pp.file == nil {
 			f, err := os.CreateTemp("", "formstream-")
 			if err != nil {
+				bufPool.Put(buf)
 				return nil, fmt.Errorf("failed to create temp file: %w", err)
 			}
 			pp.file = f
@@ -180,11 +331,13 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 
 		bufSize, err := io.Copy(pp.file, buf)
 		if err != nil {
+			bufPool.Put(buf)
 			return nil, fmt.Errorf("failed to write: %w", err)
 		}
 
 		remainSize, err := io.Copy(pp.file, normalParam.r)
 		if err != nil {
+			bufPool.Put(buf)
 			return nil, fmt.Errorf("failed to copy: %w", err)
 		}
 
@@ -208,13 +361,34 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 		}
 	}
 
-	return &abnormalParam{
+	param := &abnormalParam{
 		content: content,
 		header:  normalParam.h,
-	}, nil
+	}
+	if pp.pendingContent == nil {
+		pp.pendingContent = make(map[*abnormalParam]struct{})
+	}
+	pp.pendingContent[param] = struct{}{}
+
+	return param, nil
+}
+
+// release stops tracking a pre-processed part and closes its content if its
+// AbnormalPath never consumed it.
+func (pp *preProcessor) release(param *abnormalParam) {
+	if _, ok := pp.pendingContent[param]; !ok {
+		return
+	}
+	delete(pp.pendingContent, param)
+	_ = param.content.Close()
 }
 
 func (pp *preProcessor) Close() error {
+	for param := range pp.pendingContent {
+		delete(pp.pendingContent, param)
+		_ = param.content.Close()
+	}
+
 	if pp.file == nil {
 		return nil
 	}
@@ -238,19 +412,26 @@ func (pp *preProcessor) Close() error {
 type judgeHook struct {
 	fn           StreamHookFunc
 	requireParts []string
+	preProcessor *preProcessor
 }
 
-func (jh judgeHook) NormalPath(normalParam *normalParam) error {
+func (jh *judgeHook) NormalPath(normalParam *normalParam) error {
 	return jh.fn(normalParam.r, normalParam.h)
 }
 
-func (jh judgeHook) AbnormalPath(abnoramlParam *abnormalParam) error {
-	defer abnoramlParam.content.Close()
+func (jh *judgeHook) AbnormalPath(abnoramlParam *abnormalParam) (err error) {
+	// The content must be released even when the hook returns early without
+	// reading the whole part, or when the hook itself fails.
+	if jh.preProcessor != nil {
+		defer jh.preProcessor.release(abnoramlParam)
+	} else {
+		defer abnoramlParam.content.Close()
+	}
 
 	return jh.fn(abnoramlParam.content, abnoramlParam.header)
 }
 
-func (jh judgeHook) Requirements() []string {
+func (jh *judgeHook) Requirements() []string {
 	return jh.requireParts
 }
 
