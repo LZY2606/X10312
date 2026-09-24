@@ -2,6 +2,7 @@ package formstream
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -22,7 +23,25 @@ var (
 )
 
 // Parse parses the multipart form from r.
-func (p *Parser) Parse(r io.Reader) (err error) {
+// It is equivalent to ParseContext with a background context.
+func (p *Parser) Parse(r io.Reader) error {
+	return p.ParseContext(context.Background(), r)
+}
+
+// ParseContext parses the multipart form from r.
+// Parsing stops and the ctx error is returned when ctx is canceled.
+// Each call starts from a clean state: values and budget counters left
+// behind by a previous (possibly failed) call are reset before parsing.
+func (p *Parser) ParseContext(ctx context.Context, r io.Reader) (err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	// Reset per-parse state so that a failed call never leaks values,
+	// decremented budgets, or other temporary state into the next call.
+	p.valueMap = make(map[string][]Value)
+	p.parserConfig = p.baseConfig
+
 	hsc := newHookSatisfactionChecker(p.hookMap, &p.parserConfig)
 	defer func() {
 		deferErr := hsc.Close()
@@ -36,14 +55,32 @@ func (p *Parser) Parse(r io.Reader) (err error) {
 		}
 	}()
 
-	err = p.parse(r, hsc.IConditionJudger)
+	err = p.parse(ctx, r, hsc.IConditionJudger)
 
 	return
 }
 
-func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, *normalParam, *abnormalParam]) error {
-	mr := multipart.NewReader(r, p.boundary)
+// ctxReader aborts reads as soon as ctx is canceled. It is shared by
+// Parse and ParseContext through Parser.parse, the single parse path.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (cr *ctxReader) Read(p []byte) (int, error) {
+	if err := cr.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return cr.r.Read(p)
+}
+
+func (p *Parser) parse(ctx context.Context, r io.Reader, hsc conditionjudge.IConditionJudger[string, *normalParam, *abnormalParam]) error {
+	mr := multipart.NewReader(&ctxReader{ctx: ctx, r: r}, p.boundary)
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		var part *multipart.Part
 		part, err := mr.NextPart()
 		if err != nil {

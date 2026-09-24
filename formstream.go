@@ -11,6 +11,7 @@ type Parser struct {
 	valueMap map[string][]Value
 	hookMap  map[string]streamHook
 	parserConfig
+	baseConfig parserConfig
 }
 
 func NewParser(boundary string, options ...ParserOption) *Parser {
@@ -29,6 +30,7 @@ func NewParser(boundary string, options ...ParserOption) *Parser {
 		valueMap:     make(map[string][]Value),
 		hookMap:      make(map[string]streamHook),
 		parserConfig: c,
+		baseConfig:   c,
 	}
 }
 
