@@ -2,6 +2,7 @@ package formstream
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -22,7 +23,14 @@ var (
 )
 
 // Parse parses the multipart form from r.
-func (p *Parser) Parse(r io.Reader) (err error) {
+func (p *Parser) Parse(r io.Reader) error {
+	return p.ParseContext(context.Background(), r)
+}
+
+// ParseContext parses the multipart form from r.
+// It shares the same execution path as Parse; when ctx is canceled,
+// parsing stops and the context error is returned as the causal error.
+func (p *Parser) ParseContext(ctx context.Context, r io.Reader) (err error) {
 	hsc := newHookSatisfactionChecker(p.hookMap, &p.parserConfig)
 	defer func() {
 		deferErr := hsc.Close()
@@ -36,14 +44,34 @@ func (p *Parser) Parse(r io.Reader) (err error) {
 		}
 	}()
 
-	err = p.parse(r, hsc.IConditionJudger)
+	err = p.parse(ctx, &ctxReader{ctx: ctx, r: r}, hsc.IConditionJudger)
 
 	return
 }
 
-func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, *normalParam, *abnormalParam]) error {
+// ctxReader stops reads with the context error once ctx is canceled.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (cr *ctxReader) Read(b []byte) (int, error) {
+	select {
+	case <-cr.ctx.Done():
+		return 0, cr.ctx.Err()
+	default:
+	}
+
+	return cr.r.Read(b)
+}
+
+func (p *Parser) parse(ctx context.Context, r io.Reader, hsc conditionjudge.IConditionJudger[string, *normalParam, *abnormalParam]) error {
 	mr := multipart.NewReader(r, p.boundary)
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		var part *multipart.Part
 		part, err := mr.NextPart()
 		if err != nil {
