@@ -21,26 +21,6 @@ var (
 	ErrTooLargeForm = errors.New("too large form")
 )
 
-// Parse parses the multipart form from r.
-func (p *Parser) Parse(r io.Reader) (err error) {
-	hsc := newHookSatisfactionChecker(p.hookMap, &p.parserConfig)
-	defer func() {
-		deferErr := hsc.Close()
-		// capture the error of Close()
-		if deferErr != nil {
-			if err != nil {
-				err = errors.Join(err, deferErr)
-			} else {
-				err = deferErr
-			}
-		}
-	}()
-
-	err = p.parse(r, hsc.IConditionJudger)
-
-	return
-}
-
 func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, *normalParam, *abnormalParam]) error {
 	mr := multipart.NewReader(r, p.boundary)
 	for {
@@ -144,9 +124,10 @@ type abnormalParam struct {
 }
 
 type preProcessor struct {
-	config *parserConfig
-	offset int64
-	file   *os.File
+	config       *parserConfig
+	offset       int64
+	file         *os.File
+	openContents []io.Closer
 }
 
 var bufPool = sync.Pool{
@@ -165,6 +146,7 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 	memLimit := min(pp.config.maxMemFileSize, pp.config.maxMemSize)
 	n, err := io.CopyN(buf, normalParam.r, int64(memLimit)+1)
 	if err != nil && !errors.Is(err, io.EOF) {
+		bufPool.Put(buf)
 		return nil, fmt.Errorf("failed to copy: %w", err)
 	}
 
@@ -180,11 +162,13 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 
 		bufSize, err := io.Copy(pp.file, buf)
 		if err != nil {
+			bufPool.Put(buf)
 			return nil, fmt.Errorf("failed to write: %w", err)
 		}
 
 		remainSize, err := io.Copy(pp.file, normalParam.r)
 		if err != nil {
+			bufPool.Put(buf)
 			return nil, fmt.Errorf("failed to copy: %w", err)
 		}
 
@@ -197,24 +181,38 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 		pp.config.maxMemSize -= DataSize(buf.Len())
 		pp.config.maxMemFileSize -= DataSize(buf.Len())
 		bufSize := buf.Len()
+		closeOnce := sync.Once{}
 		content = customReadCloser{
 			Reader: buf,
 			closeFunc: func() error {
-				bufPool.Put(buf)
-				pp.config.maxMemSize += DataSize(bufSize)
-				pp.config.maxMemFileSize += DataSize(bufSize)
+				closeOnce.Do(func() {
+					bufPool.Put(buf)
+					pp.config.maxMemSize += DataSize(bufSize)
+					pp.config.maxMemFileSize += DataSize(bufSize)
+				})
 				return nil
 			},
 		}
 	}
 
-	return &abnormalParam{
+	param := &abnormalParam{
 		content: content,
 		header:  normalParam.h,
-	}, nil
+	}
+	pp.openContents = append(pp.openContents, content)
+
+	return param, nil
 }
 
 func (pp *preProcessor) Close() error {
+	// Release buffers lent to abnormal-path parts whose hooks never got a
+	// chance to close them (e.g. parsing aborted midway), so a failed call
+	// leaves no cached buffer or leaked budget behind.
+	for _, c := range pp.openContents {
+		_ = c.Close()
+	}
+	pp.openContents = nil
+
 	if pp.file == nil {
 		return nil
 	}
