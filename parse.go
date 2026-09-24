@@ -2,6 +2,7 @@ package formstream
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -22,7 +23,17 @@ var (
 )
 
 // Parse parses the multipart form from r.
-func (p *Parser) Parse(r io.Reader) (err error) {
+func (p *Parser) Parse(r io.Reader) error {
+	return p.ParseContext(context.Background(), r)
+}
+
+// ParseContext parses the multipart form from r.
+// Parsing stops as soon as ctx is canceled, and the ctx error is returned
+// as the causal error.
+// If parsing fails, the parser rolls back the values and resource budgets
+// consumed by the failed call, so retrying with the same input on the same
+// parser yields a stable result.
+func (p *Parser) ParseContext(ctx context.Context, r io.Reader) (err error) {
 	hsc := newHookSatisfactionChecker(p.hookMap, &p.parserConfig)
 	defer func() {
 		deferErr := hsc.Close()
@@ -36,14 +47,33 @@ func (p *Parser) Parse(r io.Reader) (err error) {
 		}
 	}()
 
-	err = p.parse(r, hsc.IConditionJudger)
+	backupConfig := p.parserConfig
+	backupValues := make(map[string][]Value, len(p.valueMap))
+	for key, values := range p.valueMap {
+		backupValues[key] = append([]Value(nil), values...)
+	}
+
+	err = p.parse(ctx, r, hsc.IConditionJudger)
+	if err != nil {
+		p.parserConfig = backupConfig
+		p.valueMap = backupValues
+	}
 
 	return
 }
 
-func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, *normalParam, *abnormalParam]) error {
+func (p *Parser) parse(ctx context.Context, r io.Reader, hsc conditionjudge.IConditionJudger[string, *normalParam, *abnormalParam]) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	r = &ctxReader{ctx: ctx, r: r}
+
 	mr := multipart.NewReader(r, p.boundary)
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		var part *multipart.Part
 		part, err := mr.NextPart()
 		if err != nil {
@@ -105,6 +135,21 @@ func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, 
 	}
 
 	return nil
+}
+
+// ctxReader returns the ctx error to the reader as soon as ctx is canceled,
+// so a canceled parse does not keep consuming the input.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (cr *ctxReader) Read(b []byte) (int, error) {
+	if err := cr.ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	return cr.r.Read(b)
 }
 
 type hookSatisfactionChecker struct {
