@@ -47,7 +47,12 @@ func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, 
 		var part *multipart.Part
 		part, err := mr.NextPart()
 		if err != nil {
-			if errors.Is(err, io.EOF) {
+			// Only the bare io.EOF sentinel means a clean end of the
+			// stream. mime/multipart also returns fmt-wrapped io.EOF
+			// (e.g. "multipart: NextPart: EOF") when the stream is
+			// truncated; that corruption must surface as an error
+			// instead of being mistaken for a clean termination.
+			if err == io.EOF {
 				break
 			}
 			return fmt.Errorf("failed to read next part: %w", err)
