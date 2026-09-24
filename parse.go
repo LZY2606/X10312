@@ -130,6 +130,9 @@ func newHookSatisfactionChecker(streamHooks map[string]streamHook, config *parse
 }
 
 func (wh *hookSatisfactionChecker) Close() error {
+	for _, ap := range wh.preProcessor.drainPending() {
+		_ = ap.close()
+	}
 	return wh.preProcessor.Close()
 }
 
@@ -139,14 +142,30 @@ type normalParam struct {
 }
 
 type abnormalParam struct {
-	content io.ReadCloser
-	header  Header
+	content    io.ReadCloser
+	header     Header
+	release    func()
+	releaseOnce sync.Once
+}
+
+func (ap *abnormalParam) close() error {
+	var err error
+	ap.releaseOnce.Do(func() {
+		err = ap.content.Close()
+		if ap.release != nil {
+			ap.release()
+		}
+	})
+	return err
 }
 
 type preProcessor struct {
 	config *parserConfig
 	offset int64
 	file   *os.File
+	// pending holds buffered abnormal params whose requirements were never
+	// satisfied, so Parse's cleanup can release their buffers and budgets.
+	pending []*abnormalParam
 }
 
 var bufPool = sync.Pool{
@@ -165,6 +184,7 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 	memLimit := min(pp.config.maxMemFileSize, pp.config.maxMemSize)
 	n, err := io.CopyN(buf, normalParam.r, int64(memLimit)+1)
 	if err != nil && !errors.Is(err, io.EOF) {
+		bufPool.Put(buf)
 		return nil, fmt.Errorf("failed to copy: %w", err)
 	}
 
@@ -173,6 +193,7 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 		if pp.file == nil {
 			f, err := os.CreateTemp("", "formstream-")
 			if err != nil {
+				bufPool.Put(buf)
 				return nil, fmt.Errorf("failed to create temp file: %w", err)
 			}
 			pp.file = f
@@ -180,11 +201,13 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 
 		bufSize, err := io.Copy(pp.file, buf)
 		if err != nil {
+			bufPool.Put(buf)
 			return nil, fmt.Errorf("failed to write: %w", err)
 		}
 
 		remainSize, err := io.Copy(pp.file, normalParam.r)
 		if err != nil {
+			bufPool.Put(buf)
 			return nil, fmt.Errorf("failed to copy: %w", err)
 		}
 
@@ -208,10 +231,37 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 		}
 	}
 
-	return &abnormalParam{
+	ap := &abnormalParam{
 		content: content,
 		header:  normalParam.h,
-	}, nil
+	}
+	pp.track(ap)
+
+	return ap, nil
+}
+
+// track records a buffered abnormal param so its resources are released even
+// if its requirements are never satisfied and the hook is never replayed.
+func (pp *preProcessor) track(ap *abnormalParam) {
+	ap.release = func() { pp.untrack(ap) }
+	pp.pending = append(pp.pending, ap)
+}
+
+func (pp *preProcessor) untrack(ap *abnormalParam) {
+	for i, p := range pp.pending {
+		if p == ap {
+			pp.pending = append(pp.pending[:i], pp.pending[i+1:]...)
+			return
+		}
+	}
+}
+
+// drainPending returns abnormal params that were never replayed and clears
+// the tracking list so each param is released at most once.
+func (pp *preProcessor) drainPending() []*abnormalParam {
+	pending := pp.pending
+	pp.pending = nil
+	return pending
 }
 
 func (pp *preProcessor) Close() error {
@@ -245,7 +295,7 @@ func (jh judgeHook) NormalPath(normalParam *normalParam) error {
 }
 
 func (jh judgeHook) AbnormalPath(abnoramlParam *abnormalParam) error {
-	defer abnoramlParam.content.Close()
+	defer abnoramlParam.close()
 
 	return jh.fn(abnoramlParam.content, abnoramlParam.header)
 }
