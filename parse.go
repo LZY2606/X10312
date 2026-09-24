@@ -2,6 +2,7 @@ package formstream
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -22,8 +23,21 @@ var (
 )
 
 // Parse parses the multipart form from r.
-func (p *Parser) Parse(r io.Reader) (err error) {
-	hsc := newHookSatisfactionChecker(p.hookMap, &p.parserConfig)
+// It is equivalent to ParseContext with a background context.
+func (p *Parser) Parse(r io.Reader) error {
+	return p.ParseContext(context.Background(), r)
+}
+
+// ParseContext parses the multipart form from r.
+// When ctx is canceled, parsing stops and the cancellation error is returned.
+// Each call works on a fresh snapshot of the resource budgets and resets the
+// parsed values, so a parser can be reused after a failed or canceled call
+// without inheriting half-updated counters, cached values, or temporary state.
+func (p *Parser) ParseContext(ctx context.Context, r io.Reader) (err error) {
+	cfg := p.parserConfig
+	p.valueMap = make(map[string][]Value)
+
+	hsc := newHookSatisfactionChecker(p.hookMap, &cfg, ctx)
 	defer func() {
 		deferErr := hsc.Close()
 		// capture the error of Close()
@@ -36,14 +50,18 @@ func (p *Parser) Parse(r io.Reader) (err error) {
 		}
 	}()
 
-	err = p.parse(r, hsc.IConditionJudger)
+	err = p.parse(ctx, r, hsc.IConditionJudger, &cfg)
 
 	return
 }
 
-func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, *normalParam, *abnormalParam]) error {
+func (p *Parser) parse(ctx context.Context, r io.Reader, hsc conditionjudge.IConditionJudger[string, *normalParam, *abnormalParam], cfg *parserConfig) error {
 	mr := multipart.NewReader(r, p.boundary)
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		var part *multipart.Part
 		part, err := mr.NextPart()
 		if err != nil {
@@ -53,22 +71,23 @@ func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, 
 			return fmt.Errorf("failed to read next part: %w", err)
 		}
 
-		if p.maxParts == 0 {
+		if cfg.maxParts == 0 {
 			return ErrTooManyParts
 		}
-		p.maxParts--
+		cfg.maxParts--
 
 		for _, header := range part.Header {
-			if p.maxHeaders < uint(len(header)) {
+			if cfg.maxHeaders < uint(len(header)) {
 				return ErrTooManyHeaders
 			}
-			p.maxHeaders -= uint(len(header))
+			cfg.maxHeaders -= uint(len(header))
 		}
 
 		header := newHeader(part.Header)
+		partReader := ctxReader{ctx: ctx, r: part}
 		if hsc.IsHookExist(part.FormName()) {
 			_, err := hsc.HookEvent(part.FormName(), &normalParam{
-				r: part,
+				r: partReader,
 				h: header,
 			})
 			if err != nil {
@@ -77,20 +96,20 @@ func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, 
 		} else {
 			b := new(bytes.Buffer)
 
-			if DataSize(len(part.FormName())) > p.maxMemSize {
+			if DataSize(len(part.FormName())) > cfg.maxMemSize {
 				return ErrTooLargeForm
 			}
-			p.maxMemSize -= DataSize(len(part.FormName()))
+			cfg.maxMemSize -= DataSize(len(part.FormName()))
 
-			n, err := io.Copy(b, part)
+			n, err := io.Copy(b, partReader)
 			if err != nil {
 				return fmt.Errorf("failed to copy part: %w", err)
 			}
 
-			if uint64(n) > uint64(p.maxMemSize) {
+			if uint64(n) > uint64(cfg.maxMemSize) {
 				return ErrTooLargeForm
 			}
-			p.maxMemSize -= DataSize(n)
+			cfg.maxMemSize -= DataSize(n)
 
 			p.valueMap[part.FormName()] = append(p.valueMap[part.FormName()], Value{
 				content: b.Bytes(),
@@ -107,12 +126,29 @@ func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, 
 	return nil
 }
 
+// ctxReader aborts reads with the context error once ctx is canceled.
+// A nil ctx never cancels.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (cr ctxReader) Read(p []byte) (int, error) {
+	if cr.ctx != nil {
+		if err := cr.ctx.Err(); err != nil {
+			return 0, err
+		}
+	}
+
+	return cr.r.Read(p)
+}
+
 type hookSatisfactionChecker struct {
 	conditionjudge.IConditionJudger[string, *normalParam, *abnormalParam]
 	preProcessor *preProcessor
 }
 
-func newHookSatisfactionChecker(streamHooks map[string]streamHook, config *parserConfig) *hookSatisfactionChecker {
+func newHookSatisfactionChecker(streamHooks map[string]streamHook, config *parserConfig, ctx context.Context) *hookSatisfactionChecker {
 	judgeHooks := make(map[string]conditionjudge.Hook[string, *normalParam, *abnormalParam], len(streamHooks))
 	for name, hook := range streamHooks {
 		h := judgeHook(hook)
@@ -120,6 +156,7 @@ func newHookSatisfactionChecker(streamHooks map[string]streamHook, config *parse
 	}
 
 	preProcess := &preProcessor{
+		ctx:    ctx,
 		config: config,
 	}
 
@@ -144,6 +181,7 @@ type abnormalParam struct {
 }
 
 type preProcessor struct {
+	ctx    context.Context
 	config *parserConfig
 	offset int64
 	file   *os.File
@@ -162,8 +200,10 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 	}
 	buf.Reset()
 
+	r := ctxReader{ctx: pp.ctx, r: normalParam.r}
+
 	memLimit := min(pp.config.maxMemFileSize, pp.config.maxMemSize)
-	n, err := io.CopyN(buf, normalParam.r, int64(memLimit)+1)
+	n, err := io.CopyN(buf, r, int64(memLimit)+1)
 	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("failed to copy: %w", err)
 	}
@@ -183,7 +223,7 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 			return nil, fmt.Errorf("failed to write: %w", err)
 		}
 
-		remainSize, err := io.Copy(pp.file, normalParam.r)
+		remainSize, err := io.Copy(pp.file, r)
 		if err != nil {
 			return nil, fmt.Errorf("failed to copy: %w", err)
 		}
