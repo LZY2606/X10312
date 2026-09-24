@@ -2,6 +2,7 @@ package formstream
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -19,10 +20,32 @@ var (
 	ErrTooManyHeaders = errors.New("too many headers")
 	// ErrTooLargeForm is returned when the form is too large for the parser to handle within the memory limit.
 	ErrTooLargeForm = errors.New("too large form")
+
+	// errProducerStopped is used to unblock the producer goroutine after the
+	// consumer stopped reading the multipart stream.
+	errProducerStopped = errors.New("formstream: consumer stopped reading the multipart stream")
 )
 
 // Parse parses the multipart form from r.
-func (p *Parser) Parse(r io.Reader) (err error) {
+func (p *Parser) Parse(r io.Reader) error {
+	return p.ParseWithContext(context.Background(), r)
+}
+
+// ParseWithContext parses the multipart form from r, like Parse, but honors
+// ctx.
+//
+// The form is read by a dedicated producer goroutine and handed to the parser
+// through an unbuffered pipe. When ctx is canceled, the pipe is closed with
+// the context cause, the blocked parser returns that cause as the first error,
+// and ParseWithContext does not return until the producer goroutine has
+// exited. The same guarantee holds when a hook returns an error or r fails
+// midway: the first observed causal error is returned and no producer goroutine
+// is leaked.
+//
+// A reader whose Read stays blocked forever after ctx is canceled must be
+// unblocked by its owner (for example an *http.Request.Body, which is bound to
+// the request context); ParseWithContext itself never closes r.
+func (p *Parser) ParseWithContext(ctx context.Context, r io.Reader) (err error) {
 	hsc := newHookSatisfactionChecker(p.hookMap, &p.parserConfig)
 	defer func() {
 		deferErr := hsc.Close()
@@ -36,9 +59,65 @@ func (p *Parser) Parse(r io.Reader) (err error) {
 		}
 	}()
 
-	err = p.parse(r, hsc.IConditionJudger)
+	parseReader := r
+	if ctx.Done() != nil {
+		pr, pw := io.Pipe()
+
+		producerDone := make(chan struct{})
+		go func() {
+			defer close(producerDone)
+			pipeReaderToWriter(ctx, pw, r)
+		}()
+		parseReader = pr
+
+		defer func() {
+			// Unblock the producer: on cancellation the context cause has
+			// priority, otherwise the parser has stopped consuming the stream.
+			if cause := context.Cause(ctx); cause != nil {
+				pr.CloseWithError(cause)
+			} else {
+				pr.CloseWithError(errProducerStopped)
+			}
+			<-producerDone
+		}()
+	}
+
+	err = p.parse(parseReader, hsc.IConditionJudger)
 
 	return
+}
+
+// pipeReaderToWriter copies r to pw without ever buffering the whole stream.
+// It returns once r reaches EOF, fails, ctx is canceled, or the read side of
+// the pipe is closed because parsing stopped.
+func pipeReaderToWriter(ctx context.Context, pw *io.PipeWriter, r io.Reader) {
+	stop := context.AfterFunc(ctx, func() {
+		pw.CloseWithError(context.Cause(ctx))
+	})
+	defer stop()
+
+	buf := make([]byte, 32*1024)
+	for {
+		if cause := context.Cause(ctx); cause != nil {
+			pw.CloseWithError(cause)
+			return
+		}
+
+		n, readErr := r.Read(buf)
+		if n > 0 {
+			if _, writeErr := pw.Write(buf[:n]); writeErr != nil {
+				return
+			}
+		}
+
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				readErr = nil
+			}
+			pw.CloseWithError(readErr)
+			return
+		}
+	}
 }
 
 func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, *normalParam, *abnormalParam]) error {
@@ -162,6 +241,15 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 	}
 	buf.Reset()
 
+	// The buffer is returned to the pool on every error and on the disk path.
+	// The memory path transfers ownership to the customReadCloser.
+	returnBuf := true
+	defer func() {
+		if returnBuf {
+			bufPool.Put(buf)
+		}
+	}()
+
 	memLimit := min(pp.config.maxMemFileSize, pp.config.maxMemSize)
 	n, err := io.CopyN(buf, normalParam.r, int64(memLimit)+1)
 	if err != nil && !errors.Is(err, io.EOF) {
@@ -191,8 +279,6 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 		size := bufSize + remainSize
 		content = io.NopCloser(io.NewSectionReader(pp.file, pp.offset, size))
 		pp.offset += size
-
-		bufPool.Put(buf)
 	} else {
 		pp.config.maxMemSize -= DataSize(buf.Len())
 		pp.config.maxMemFileSize -= DataSize(buf.Len())
@@ -206,6 +292,7 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 				return nil
 			},
 		}
+		returnBuf = false
 	}
 
 	return &abnormalParam{
