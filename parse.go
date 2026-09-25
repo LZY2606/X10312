@@ -2,6 +2,7 @@ package formstream
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -22,8 +23,21 @@ var (
 )
 
 // Parse parses the multipart form from r.
-func (p *Parser) Parse(r io.Reader) (err error) {
-	hsc := newHookSatisfactionChecker(p.hookMap, &p.parserConfig)
+func (p *Parser) Parse(r io.Reader) error {
+	return p.ParseContext(context.Background(), r)
+}
+
+// ParseContext parses the multipart form from r.
+// It aborts with the context's error when ctx is canceled,
+// keeping the context error as the causal error of the failure.
+func (p *Parser) ParseContext(ctx context.Context, r io.Reader) (err error) {
+	// Each parse works on a fresh copy of the configuration and a fresh
+	// value map, so that counters and buffered values left by a previous
+	// (possibly failed) call never leak into this one.
+	cfg := p.parserConfig
+	p.valueMap = make(map[string][]Value)
+
+	hsc := newHookSatisfactionChecker(p.hookMap, &cfg)
 	defer func() {
 		deferErr := hsc.Close()
 		// capture the error of Close()
@@ -36,12 +50,37 @@ func (p *Parser) Parse(r io.Reader) (err error) {
 		}
 	}()
 
-	err = p.parse(r, hsc.IConditionJudger)
+	err = p.parseWithConfig(ctx, r, &cfg, hsc.IConditionJudger)
 
 	return
 }
 
 func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, *normalParam, *abnormalParam]) error {
+	cfg := p.parserConfig
+	return p.parseWithConfig(context.Background(), r, &cfg, hsc)
+}
+
+// ctxReader aborts reads with the context's error once ctx is canceled.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (cr *ctxReader) Read(b []byte) (int, error) {
+	select {
+	case <-cr.ctx.Done():
+		return 0, cr.ctx.Err()
+	default:
+	}
+
+	return cr.r.Read(b)
+}
+
+func (p *Parser) parseWithConfig(ctx context.Context, r io.Reader, cfg *parserConfig, hsc conditionjudge.IConditionJudger[string, *normalParam, *abnormalParam]) error {
+	if ctx != nil {
+		r = &ctxReader{ctx: ctx, r: r}
+	}
+
 	mr := multipart.NewReader(r, p.boundary)
 	for {
 		var part *multipart.Part
@@ -53,16 +92,16 @@ func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, 
 			return fmt.Errorf("failed to read next part: %w", err)
 		}
 
-		if p.maxParts == 0 {
+		if cfg.maxParts == 0 {
 			return ErrTooManyParts
 		}
-		p.maxParts--
+		cfg.maxParts--
 
 		for _, header := range part.Header {
-			if p.maxHeaders < uint(len(header)) {
+			if cfg.maxHeaders < uint(len(header)) {
 				return ErrTooManyHeaders
 			}
-			p.maxHeaders -= uint(len(header))
+			cfg.maxHeaders -= uint(len(header))
 		}
 
 		header := newHeader(part.Header)
@@ -77,20 +116,20 @@ func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, 
 		} else {
 			b := new(bytes.Buffer)
 
-			if DataSize(len(part.FormName())) > p.maxMemSize {
+			if DataSize(len(part.FormName())) > cfg.maxMemSize {
 				return ErrTooLargeForm
 			}
-			p.maxMemSize -= DataSize(len(part.FormName()))
+			cfg.maxMemSize -= DataSize(len(part.FormName()))
 
 			n, err := io.Copy(b, part)
 			if err != nil {
 				return fmt.Errorf("failed to copy part: %w", err)
 			}
 
-			if uint64(n) > uint64(p.maxMemSize) {
+			if uint64(n) > uint64(cfg.maxMemSize) {
 				return ErrTooLargeForm
 			}
-			p.maxMemSize -= DataSize(n)
+			cfg.maxMemSize -= DataSize(n)
 
 			p.valueMap[part.FormName()] = append(p.valueMap[part.FormName()], Value{
 				content: b.Bytes(),
