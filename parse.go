@@ -2,6 +2,7 @@ package formstream
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -23,6 +24,14 @@ var (
 
 // Parse parses the multipart form from r.
 func (p *Parser) Parse(r io.Reader) (err error) {
+	// The parserConfig budget counters and valueMap are mutated while parsing.
+	// Save them so that a failed parse leaves no half-updated shared state
+	// behind and the same input can be retried with a stable result.
+	savedConfig := p.parserConfig
+	defer func() {
+		p.parserConfig = savedConfig
+	}()
+
 	hsc := newHookSatisfactionChecker(p.hookMap, &p.parserConfig)
 	defer func() {
 		deferErr := hsc.Close()
@@ -36,9 +45,61 @@ func (p *Parser) Parse(r io.Reader) (err error) {
 		}
 	}()
 
+	valueSnapshot := make(map[string]int, len(p.valueMap))
+	for key, values := range p.valueMap {
+		valueSnapshot[key] = len(values)
+	}
+	defer func() {
+		if err == nil {
+			return
+		}
+		for key := range p.valueMap {
+			n, ok := valueSnapshot[key]
+			if !ok {
+				delete(p.valueMap, key)
+				continue
+			}
+			p.valueMap[key] = p.valueMap[key][:n]
+		}
+	}()
+
 	err = p.parse(r, hsc.IConditionJudger)
 
 	return
+}
+
+// ParseContext parses the multipart form from r like Parse, but aborts when
+// ctx is done. The parsing runs in a separate goroutine; when ctx is
+// canceled, r is closed if it implements io.Closer to unblock pending reads,
+// and ParseContext waits for the parsing goroutine to exit before returning.
+// The returned error preserves the first causal error: it matches ctx.Err()
+// via errors.Is, and any error the parse itself produced is joined in as well.
+// Note that cancellation cannot unblock a Read on r unless r is an io.Closer
+// whose Close unblocks Read, or r unblocks itself.
+func (p *Parser) ParseContext(ctx context.Context, r io.Reader) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- p.Parse(r)
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		if closer, ok := r.(io.Closer); ok {
+			_ = closer.Close()
+		}
+		parseErr := <-done
+		if parseErr != nil {
+			return errors.Join(ctx.Err(), parseErr)
+		}
+
+		return ctx.Err()
+	}
 }
 
 func (p *Parser) parse(r io.Reader, hsc conditionjudge.IConditionJudger[string, *normalParam, *abnormalParam]) error {
