@@ -22,7 +22,17 @@ var (
 )
 
 // Parse parses the multipart form from r.
+// Parsed values and consumed resource budgets are committed only when
+// parsing succeeds; a failed Parse rolls the parser back to its prior
+// state so the same input can be retried with a stable result.
 func (p *Parser) Parse(r io.Reader) (err error) {
+	prevConfig := p.parserConfig
+	prevValueMap := p.valueMap
+	p.valueMap = make(map[string][]Value, len(prevValueMap))
+	for key, values := range prevValueMap {
+		p.valueMap[key] = values
+	}
+
 	hsc := newHookSatisfactionChecker(p.hookMap, &p.parserConfig)
 	defer func() {
 		deferErr := hsc.Close()
@@ -33,6 +43,11 @@ func (p *Parser) Parse(r io.Reader) (err error) {
 			} else {
 				err = deferErr
 			}
+		}
+
+		if err != nil {
+			p.parserConfig = prevConfig
+			p.valueMap = prevValueMap
 		}
 	}()
 
@@ -165,6 +180,7 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 	memLimit := min(pp.config.maxMemFileSize, pp.config.maxMemSize)
 	n, err := io.CopyN(buf, normalParam.r, int64(memLimit)+1)
 	if err != nil && !errors.Is(err, io.EOF) {
+		bufPool.Put(buf)
 		return nil, fmt.Errorf("failed to copy: %w", err)
 	}
 
@@ -173,6 +189,7 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 		if pp.file == nil {
 			f, err := os.CreateTemp("", "formstream-")
 			if err != nil {
+				bufPool.Put(buf)
 				return nil, fmt.Errorf("failed to create temp file: %w", err)
 			}
 			pp.file = f
@@ -180,11 +197,13 @@ func (pp *preProcessor) run(normalParam *normalParam) (*abnormalParam, error) {
 
 		bufSize, err := io.Copy(pp.file, buf)
 		if err != nil {
+			bufPool.Put(buf)
 			return nil, fmt.Errorf("failed to write: %w", err)
 		}
 
 		remainSize, err := io.Copy(pp.file, normalParam.r)
 		if err != nil {
+			bufPool.Put(buf)
 			return nil, fmt.Errorf("failed to copy: %w", err)
 		}
 
