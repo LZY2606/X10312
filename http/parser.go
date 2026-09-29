@@ -1,5 +1,6 @@
 package httpform
 
+import "context"
 import (
 	"io"
 	"mime"
@@ -10,6 +11,7 @@ import (
 
 type Parser struct {
 	*formstream.Parser
+	ctx    context.Context
 	reader io.Reader
 }
 
@@ -27,10 +29,11 @@ func NewParser(req *http.Request, options ...formstream.ParserOption) (*Parser, 
 
 	return &Parser{
 		Parser: formstream.NewParser(boundary, options...),
+		ctx:    req.Context(),
 		reader: req.Body,
 	}, nil
 }
 
 func (p *Parser) Parse() error {
-	return p.Parser.Parse(p.reader)
+	return p.Parser.ParseContext(p.ctx, p.reader)
 }

@@ -420,7 +420,7 @@ func TestPreProcessor_run(t *testing.T) {
 						t.Errorf("unexpected value: expected %s, actual %s", string(tt.value), b.String())
 					}
 
-					_, ok := r.content.(customReadCloser)
+					_, ok := r.content.(*customReadCloser)
 					switch readerType {
 					case "memory":
 						if !ok {
